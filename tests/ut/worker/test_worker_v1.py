@@ -1079,6 +1079,7 @@ class TestNPUWorker(TestBase):
     def test_compile_or_warm_up_model_with_eager_mode(self, mock_warm_up_atb,
                                                       mock_logger):
         """Test compile_or_warm_up_model method - eager mode"""
+        from vllm.v1.worker.worker_base import CompilationTimes
         from vllm_ascend.worker.worker import NPUWorker
 
         # Create worker mock
@@ -1096,9 +1097,11 @@ class TestNPUWorker(TestBase):
             worker.vllm_config.compilation_config.cudagraph_capture_sizes = [
                 4, 8
             ]
+            worker.vllm_config.compilation_config.compilation_time = 12.5
+            worker.vllm_config.compilation_config.encoder_compilation_time = 1.25
 
             # Test compile_or_warm_up_model
-            worker.compile_or_warm_up_model()
+            result = worker.compile_or_warm_up_model()
 
             # Verify _dummy_run call count and order (by size descending)
             expected_calls = [
@@ -1117,6 +1120,11 @@ class TestNPUWorker(TestBase):
 
             # Verify atb warm up
             mock_warm_up_atb.assert_called_once()
+
+            self.assertEqual(
+                result,
+                CompilationTimes(language_model=12.5, encoder=1.25),
+            )
 
     @patch("vllm_ascend.worker.worker.logger")
     @patch("vllm_ascend.worker.worker.NPUWorker._warm_up_atb")
