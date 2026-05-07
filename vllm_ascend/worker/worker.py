@@ -19,12 +19,9 @@
 
 import copy
 import gc
-import math
-import os
-import subprocess
+import logging
 from types import NoneType
 
-import regex as re
 import torch
 import torch.nn as nn
 import torch_npu
@@ -41,13 +38,16 @@ from vllm.lora.request import LoRARequest
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.mem_constants import GiB_bytes
-from vllm.utils.mem_utils import MemorySnapshot, memory_profiling
+from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
-from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
+from vllm.v1.worker.worker_base import (
+    CompilationTimes,  # noqa: E402
+    WorkerBase,
+)
 from vllm.v1.worker.workspace import init_workspace_manager
 
 import vllm_ascend.envs as envs_ascend
@@ -78,192 +78,6 @@ torch_non_c_binding_in_graph_functions_npu["torch.npu.stream"] = TorchInGraphFun
 torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
 
 
-def _format_startup_memory_error(
-    free_memory: int,
-    total_memory: int,
-    gpu_memory_utilization: float,
-    visible_device_count: int,
-) -> str:
-    gib = lambda value: round(value / GiB_bytes, 2)
-
-    requested_memory = total_memory * gpu_memory_utilization
-    max_usable_ratio = free_memory / total_memory if total_memory > 0 else 0.0
-    suggested_ratio = max(0.01, math.floor(max(max_usable_ratio - 0.01, 0.0) * 100) / 100)
-
-    message_lines = [
-        (
-            f"Free memory on device ({gib(free_memory)}/{gib(total_memory)} GiB) on startup "
-            f"is less than desired GPU memory utilization ({gpu_memory_utilization}, "
-            f"{gib(requested_memory)} GiB)."
-        ),
-        (
-            "Free memory on the selected Ascend device or lower "
-            f"`--gpu-memory-utilization` to at most about {suggested_ratio:.2f}."
-        ),
-    ]
-
-    if visible_device_count > 1 and not os.environ.get("ASCEND_RT_VISIBLE_DEVICES"):
-        message_lines.append(
-            "Multiple Ascend devices are visible. If other cards are idle, select one first with "
-            "`ASCEND_RT_VISIBLE_DEVICES=<id>` after checking `npu-smi info`."
-        )
-
-    return " ".join(message_lines)
-
-
-def _parse_npu_smi_logical_map(mapping_output: str) -> dict[tuple[str, str], int]:
-    logical_map: dict[tuple[str, str], int] = {}
-    for line in mapping_output.splitlines():
-        parts = line.split()
-        if len(parts) < 3:
-            continue
-        npu_id, chip_id, logical_id = parts[:3]
-        if npu_id.isdigit() and chip_id.isdigit() and logical_id.isdigit():
-            logical_map[(npu_id, chip_id)] = int(logical_id)
-    return logical_map
-
-
-def _parse_npu_smi_hbm_stats(
-    info_output: str,
-    logical_map: dict[tuple[str, str], int],
-    visible_device_count: int,
-) -> list[tuple[int, int, int]]:
-    hbm_usage_pattern = re.compile(r"(\d+)\s*/\s*(\d+)\s*$")
-    device_stats: list[tuple[int, int, int]] = []
-    current_npu_id: str | None = None
-    current_health: str | None = None
-
-    for raw_line in info_output.splitlines():
-        line = raw_line.strip()
-        if not line.startswith("|"):
-            continue
-
-        parts = [part.strip() for part in line.strip("|").split("|")]
-        if len(parts) < 3:
-            continue
-
-        left_column = parts[0].split()
-        if len(left_column) >= 2 and left_column[0].isdigit() and parts[1] and ":" not in parts[1]:
-            current_npu_id = left_column[0]
-            current_health = parts[1]
-            continue
-
-        if current_npu_id is None or current_health != "OK":
-            continue
-
-        if len(left_column) != 1 or not left_column[0].isdigit() or ":" not in parts[1]:
-            continue
-
-        chip_id = left_column[0]
-        logical_id = logical_map.get((current_npu_id, chip_id))
-        if logical_id is None or logical_id >= visible_device_count:
-            continue
-
-        hbm_match = hbm_usage_pattern.search(parts[2])
-        if hbm_match is None:
-            continue
-
-        used_memory_mb = int(hbm_match.group(1))
-        total_memory_mb = int(hbm_match.group(2))
-        free_memory_mb = max(0, total_memory_mb - used_memory_mb)
-        device_stats.append((logical_id, free_memory_mb << 20, total_memory_mb << 20))
-
-    return device_stats
-
-
-def _select_best_idle_ascend_device(visible_device_count: int) -> tuple[int, int, int] | None:
-    if visible_device_count <= 1:
-        return None
-
-    mapping_result = subprocess.run(
-        ["npu-smi", "info", "-m"],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    if mapping_result.returncode != 0:
-        raise RuntimeError(mapping_result.stderr.strip() or "npu-smi info -m failed")
-
-    info_result = subprocess.run(
-        ["npu-smi", "info"],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    if info_result.returncode != 0:
-        raise RuntimeError(info_result.stderr.strip() or "npu-smi info failed")
-
-    logical_map = _parse_npu_smi_logical_map(mapping_result.stdout)
-    device_stats = _parse_npu_smi_hbm_stats(info_result.stdout, logical_map, visible_device_count)
-    if not device_stats:
-        return None
-
-    device_stats.sort(key=lambda item: (-item[1], item[0]))
-    return device_stats[0]
-
-
-def _get_visible_ascend_device_count() -> int:
-    visible_devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
-    if visible_devices.strip():
-        return len([device for device in visible_devices.split(",") if device.strip()])
-
-    mapping_result = subprocess.run(
-        ["npu-smi", "info", "-m"],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    if mapping_result.returncode != 0:
-        raise RuntimeError(mapping_result.stderr.strip() or "npu-smi info -m failed")
-
-    logical_map = _parse_npu_smi_logical_map(mapping_result.stdout)
-    return len(set(logical_map.values()))
-
-
-def _maybe_auto_select_idle_ascend_device(local_rank: int, parallel_config) -> None:
-    if os.environ.get("ASCEND_RT_VISIBLE_DEVICES"):
-        return
-
-    if local_rank != 0:
-        return
-
-    if getattr(parallel_config, "world_size", 1) != 1:
-        return
-
-    if getattr(parallel_config, "local_world_size", 1) != 1:
-        return
-
-    try:
-        visible_device_count = _get_visible_ascend_device_count()
-    except Exception as exc:
-        logger.info("Unable to inspect Ascend visibility before auto-selection: %s", exc)
-        return
-
-    if visible_device_count <= 1:
-        return
-
-    try:
-        selected_device = _select_best_idle_ascend_device(visible_device_count)
-    except Exception as exc:
-        logger.info("Unable to auto-select an idle Ascend device: %s", exc)
-        return
-
-    if selected_device is None:
-        return
-
-    logical_id, free_memory, total_memory = selected_device
-    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(logical_id)
-    logger.info(
-        "Auto-selected Ascend device %s for single-card startup (free %.2f/%.2f GiB).",
-        logical_id,
-        free_memory / GiB_bytes,
-        total_memory / GiB_bytes,
-    )
-
-
 class NPUWorker(WorkerBase):
     def __init__(
         self,
@@ -292,13 +106,7 @@ class NPUWorker(WorkerBase):
 
         ops.register_dummy_fusion_op()
         if get_ascend_device_type() != AscendDeviceType.A5:
-            try:
-                _register_atb_extensions()
-            except Exception as exc:
-                logger.warning(
-                    "Failed to register ATB extensions (%s). Continuing without ATB extension ops.",
-                    exc,
-                )
+            _register_atb_extensions()
         register_ascend_customop(vllm_config)
         # init ascend config and soc version
         init_ascend_config(vllm_config)
@@ -412,7 +220,7 @@ class NPUWorker(WorkerBase):
 
         hidden_size = self.vllm_config.model_config.hf_text_config.hidden_size
         model = self.model_runner.model
-        if tags is None or "weights" in tags:
+        if self.vllm_config.quant_config is None and (tags is None or "weights" in tags):
             for name, param in model.named_parameters():
                 if "w2_weight" in name and param.shape[2] == hidden_size:
                     parts = name.split(".")
@@ -443,8 +251,6 @@ class NPUWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def _init_device(self):
-        _maybe_auto_select_idle_ascend_device(self.local_rank, self.parallel_config)
-
         device = torch.device(f"npu:{self.local_rank}")
         torch.npu.set_device(device)
 
@@ -464,14 +270,15 @@ class NPUWorker(WorkerBase):
         self.init_snapshot = MemorySnapshot()
         self.requested_memory = self.init_snapshot.total_memory * self.cache_config.gpu_memory_utilization
         if self.init_snapshot.free_memory < self.requested_memory:
-            visible_device_count = torch.npu.device_count() if torch.npu.is_available() else 0
+            GiB = lambda b: round(b / GiB_bytes, 2)
             raise ValueError(
-                _format_startup_memory_error(
-                    free_memory=self.init_snapshot.free_memory,
-                    total_memory=self.init_snapshot.total_memory,
-                    gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
-                    visible_device_count=visible_device_count,
-                )
+                f"Free memory on device "
+                f"({GiB(self.init_snapshot.free_memory)}/"
+                f"{GiB(self.init_snapshot.total_memory)} GiB) on startup "
+                f"is less than desired GPU memory utilization "
+                f"({self.cache_config.gpu_memory_utilization}, "
+                f"{GiB(self.requested_memory)} GiB). Decrease GPU memory "
+                f"utilization or reduce GPU memory used by other processes."
             )
 
         if (
@@ -495,12 +302,6 @@ class NPUWorker(WorkerBase):
         # Initialize device properties used by triton kernels.
         init_device_properties_triton()
 
-        # binding cpu
-        if get_ascend_config().enable_cpu_binding:
-            try:
-                bind_cpus(self.local_rank)
-            except Exception as e:
-                logger.warning(f"Bind cpus failed in rank{self.local_rank}: {e} Skip binding cpu.")
         return device
 
     def init_device(self):
@@ -531,6 +332,24 @@ class NPUWorker(WorkerBase):
         """
         GiB = lambda b: b / GiB_bytes
 
+        # Fast path: user has explicitly specified KV cache size via
+        # --kv-cache-memory. Still run profile_run() to compile the model,
+        # but skip the memory profiling calculation entirely.
+        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+            self.model_runner.profile_run()
+            logger.info(
+                "Initial free memory %.2f GiB, reserved %.2f GiB for KV Cache "
+                "as specified by kv_cache_memory_bytes, skipping memory profiling. "
+                "This does not respect the gpu_memory_utilization config. "
+                "Only use kv_cache_memory_bytes when you want manual control of "
+                "KV cache memory size. If OOM'ed, check the difference of initial "
+                "free memory between the current run and the previous run where "
+                "kv_cache_memory_bytes is suggested and update it correspondingly.",
+                GiB(self.init_snapshot.free_memory),
+                GiB(kv_cache_memory_bytes),
+            )
+            return kv_cache_memory_bytes
+
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         with memory_profiling(
@@ -538,6 +357,23 @@ class NPUWorker(WorkerBase):
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
             self.model_runner.profile_run()
+
+            # Record torch peak INSIDE the context and BEFORE graph capture,
+            # so that graph pool allocations don't inflate the activation peak.
+            # The memory_profiling context will also compute torch_peak_increase
+            # on exit, but we override it below with this pre-graph value.
+            profile_torch_peak = torch.npu.memory_stats(self.device).get("allocated_bytes.all.peak", 0)
+
+        # Override torch_peak_increase with the pre-graph-capture value to
+        # avoid double-counting graph pool memory as activation memory.
+        profile_result.torch_peak_increase = profile_torch_peak - profile_result.before_profile.torch_peak
+        profile_result.non_kv_cache_memory = (
+            profile_result.non_torch_increase + profile_result.torch_peak_increase + profile_result.weights_memory
+        )
+
+        # Save per-category memory for use in compile_or_warm_up_model() (step 5).
+        self.peak_activation_memory = profile_result.torch_peak_increase
+        self.non_torch_memory = profile_result.non_torch_increase
 
         free_gpu_memory = profile_result.after_profile.free_memory
         assert self.init_snapshot.free_memory > free_gpu_memory, (
@@ -550,6 +386,7 @@ class NPUWorker(WorkerBase):
             "isolate vLLM in its own container."
         )
         self.available_kv_cache_memory_bytes = self.requested_memory - profile_result.non_kv_cache_memory
+
         logger.debug(profile_result)
         logger.info_once(
             "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"
@@ -636,7 +473,7 @@ class NPUWorker(WorkerBase):
         with context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
 
-    def compile_or_warm_up_model(self) -> CompilationTimes:
+    def compile_or_warm_up_model(self):
         # Note: need to adapt for graph mode.
         warmup_sizes = (self.vllm_config.compilation_config.compile_sizes or []).copy()
         if not self.model_config.enforce_eager:
@@ -659,18 +496,67 @@ class NPUWorker(WorkerBase):
         for size in sorted(warmup_sizes, reverse=True):
             logger.info("Compile and warming up model for size %d", size)
             self.model_runner._dummy_run(size)
+
+        npugraph_memory_bytes = 0
         if not self.model_config.enforce_eager:
-            self.model_runner.capture_model()
+            npugraph_memory_bytes = self.model_runner.capture_model()
+
+        # Suggest an optimal --kv-cache-memory value for future runs.
+        # Only emitted when we ran full profiling (kv_cache_memory_bytes was not
+        # pre-specified) so that peak_activation_memory etc. are available.
+        # non_kv_memory already includes NPU graph memory, so the suggestion
+        # accounts for all measured memory categories. A 150 MiB buffer is kept
+        # because memory_profiling may slightly underestimate non-torch
+        # allocations (ACL context, HCCL buffers, driver layer, etc.).
+        if self.cache_config.kv_cache_memory_bytes is None and hasattr(self, "peak_activation_memory"):
+            redundancy_buffer = 150 * (1 << 20)  # 150 MiB safety margin
+            non_kv_memory = (
+                self.model_runner.model_memory_usage
+                + self.peak_activation_memory
+                + self.non_torch_memory
+                + npugraph_memory_bytes
+            )
+            suggested_to_requested = int(self.requested_memory) - non_kv_memory - redundancy_buffer
+            suggested_to_gpu_limit = int(self.init_snapshot.free_memory) - non_kv_memory - redundancy_buffer
+            msg = (
+                f"Free memory on device "
+                f"({format_gib(self.init_snapshot.free_memory)}/"
+                f"{format_gib(self.init_snapshot.total_memory)} GiB) on startup. "
+                f"Desired GPU memory utilization is "
+                f"({self.cache_config.gpu_memory_utilization}, "
+                f"{format_gib(self.requested_memory)} GiB). "
+                f"Actual usage: {format_gib(self.model_runner.model_memory_usage)} GiB "
+                f"for weights, {format_gib(self.peak_activation_memory)} GiB for peak "
+                f"activation, {format_gib(self.non_torch_memory)} GiB for non-torch "
+                f"memory, {format_gib(npugraph_memory_bytes)} GiB for NPU graph memory. "
+                f"Replace gpu_memory_utilization with "
+                f"`--kv-cache-memory={suggested_to_requested}` "
+                f"({format_gib(suggested_to_requested)} GiB) to fit into requested "
+                f"memory, or `--kv-cache-memory={suggested_to_gpu_limit}` "
+                f"({format_gib(suggested_to_gpu_limit)} GiB) to fully utilize NPU "
+                f"free memory. Current KV cache memory: "
+                f"{format_gib(self.available_kv_cache_memory_bytes)} GiB."
+            )
+            logger.info(msg)
+
         # Call ATB matmul to warm up; otherwise, the first operation (ReshapeAndCache)
         # may cause performance degradation at runtime.
         if get_ascend_device_type() != AscendDeviceType.A5:
             self._warm_up_atb()
+        # Bind after warmup so hot allocations are already materialized on the
+        # worker process before migratepages/taskset run.
+        if get_ascend_config().enable_cpu_binding:
+            try:
+                bind_cpus(self.local_rank)
+            except Exception as e:
+                logger.warning("Bind cpus failed in rank%s: %s Skip binding cpu.", self.local_rank, e)
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+
         return CompilationTimes(
             language_model=self.vllm_config.compilation_config.compilation_time,
-            encoder=self.vllm_config.compilation_config.encoder_compilation_time,
+            encoder=self.compilation_config.encoder_compilation_time,
         )
 
     def _warm_up_atb(self):
@@ -681,6 +567,69 @@ class NPUWorker(WorkerBase):
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
+
+    @torch.inference_mode()
+    def profile_prefill_latency(self, num_tokens: int) -> float:
+        """
+        Profile prefill latency for a given number of tokens.
+
+        This runs a real model forward pass and measures the execution time.
+        Used for profiling-based dynamic chunk sizing.
+
+        In PP (Pipeline Parallelism) mode:
+        - All workers execute the forward pass to stay synchronized
+        - Only the timing from PP0 (first rank) is meaningful for scheduling
+        - PP0 includes all the pipeline stages' latency when using async scheduling
+
+        Args:
+            num_tokens: Number of tokens to profile
+
+        Returns:
+            Latency in milliseconds
+        """
+        import time
+
+        # Clamp to valid range
+        num_tokens = min(num_tokens, self.scheduler_config.max_num_batched_tokens)
+        num_tokens = max(num_tokens, 1)
+
+        # Synchronize all devices before timing
+        # This ensures clean measurement in PP/TP scenarios
+        torch.npu.synchronize()
+
+        # In PP mode, we still run on all ranks to keep them synchronized
+        # but only the first rank's timing is used for scheduling decisions
+        is_first_pp_rank = get_pp_group().is_first_rank
+
+        start = time.perf_counter()
+
+        # Run real model forward with force_attention=True
+        # This ensures attention is actually executed, not skipped.
+        # Without force_attention, attn_metadata may be None and attention
+        # won't run, making profiling results inaccurate.
+        # _dummy_run handles PP internally (intermediate tensors, etc.)
+        self.model_runner._dummy_run(
+            num_tokens=num_tokens,
+            force_attention=True,  # Critical: ensure attention is executed
+            profile_cpp=True,
+        )
+
+        # Synchronize after forward to ensure NPU operations complete
+        torch.npu.synchronize()
+
+        latency_ms = (time.perf_counter() - start) * 1000
+
+        # Log for debugging in PP mode
+        if not is_first_pp_rank:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[ProfilingChunk] PP rank %d: profiled %d tokens, latency=%.2f ms (not used)",
+                    get_pp_group().rank_in_group,
+                    num_tokens,
+                    latency_ms,
+                )
+
+        return latency_ms
 
     def get_kv_connector_handshake_metadata(self) -> dict | None:
         """Get KV connector metadata from this worker if available."""
@@ -802,7 +751,7 @@ class NPUWorker(WorkerBase):
             export_type=torch_npu.profiler.ExportType.Text,
             profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
             msprof_tx=False,
-            aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
             l2_cache=False,
             op_attr=False,
             data_simplification=True,
@@ -852,13 +801,13 @@ class NPUWorker(WorkerBase):
                 parse_text_output(result.stdout)
                 logger.info("check_health success!")
             else:
-                logger.info(f"query NPU card {self.local_rank} fail: {result.stderr}")
+                logger.info("query NPU card %s fail: %s", self.local_rank, result.stderr)
         except subprocess.TimeoutExpired:
-            logger.info(f"query NPU card  {self.local_rank} timeout.")
+            logger.info("query NPU card  %s timeout.", self.local_rank)
         except FileNotFoundError:
             logger.info("npu-smi tool not found.")
         except Exception as e:
-            logger.info(f"query NPU card {self.local_rank} fail: {e}")
+            logger.info("query NPU card %s fail: %s", self.local_rank, e)
         return
 
 
