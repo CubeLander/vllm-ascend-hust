@@ -73,10 +73,10 @@ server_pid=""
 server_group_pid=""
 
 cleanup() {
-  if [[ -n "$server_group_pid" ]] && kill -0 "$server_group_pid" 2>/dev/null; then
+  if [[ -n "$server_group_pid" ]]; then
     kill -TERM -- "-$server_group_pid" 2>/dev/null || true
     for _ in $(seq 1 10); do
-      if ! kill -0 "$server_group_pid" 2>/dev/null; then
+      if ! kill -0 -- "-$server_group_pid" 2>/dev/null; then
         break
       fi
       sleep 1
@@ -100,7 +100,8 @@ server_log_indicates_resource_busy() {
 
 start_server() {
   if command -v setsid >/dev/null 2>&1; then
-    setsid env VLLM_ASCEND_TORCH_PREFLIGHT=0 "${VLLM_SERVE[@]}" "$MODEL_NAME" \
+    setsid env VLLM_ASCEND_TORCH_PREFLIGHT=0 "${VLLM_SERVE[@]}" \
+      --model "$MODEL_NAME" \
       --host "$HOST" \
       --port "$PORT" \
       --dtype "$DTYPE" \
@@ -110,7 +111,8 @@ start_server() {
     server_pid=$!
     server_group_pid=$server_pid
   else
-    env VLLM_ASCEND_TORCH_PREFLIGHT=0 "${VLLM_SERVE[@]}" "$MODEL_NAME" \
+    env VLLM_ASCEND_TORCH_PREFLIGHT=0 "${VLLM_SERVE[@]}" \
+      --model "$MODEL_NAME" \
       --host "$HOST" \
       --port "$PORT" \
       --dtype "$DTYPE" \
