@@ -28,6 +28,33 @@ hust_resolve_python_bin() {
   _resolve_hust_ascend_manager_python "$@"
 }
 
+hust_run_pip() {
+  if command -v pip >/dev/null 2>&1; then
+    pip "$@"
+    return $?
+  fi
+
+  if command -v pip3 >/dev/null 2>&1; then
+    pip3 "$@"
+    return $?
+  fi
+
+  local python_bin
+  python_bin="$(_resolve_hust_ascend_manager_python 2>/dev/null)" || {
+    echo "[ERROR] Could not locate python3/python for pip operations" >&2
+    return 1
+  }
+
+  if ! "${python_bin}" -m pip --version >/dev/null 2>&1; then
+    if ! "${python_bin}" -m ensurepip --upgrade >/dev/null 2>&1; then
+      echo "[ERROR] Could not locate pip or bootstrap it with ensurepip" >&2
+      return 1
+    fi
+  fi
+
+  "${python_bin}" -m pip "$@"
+}
+
 _resolve_hust_ascend_manager_src() {
   local manager_repo="${HUST_ASCEND_MANAGER_REPO:-${_HUST_MANAGER_WORKSPACE_ROOT}/ascend-runtime-manager}"
   local manager_src="${manager_repo}/src"

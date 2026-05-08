@@ -258,9 +258,9 @@ jobs:
         run: |
           mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME"
           source scripts/use_single_ascend_env.sh
-          python3 -m pip install -e "$VLLM_HUST_REPO" --no-build-isolation --no-deps
+          hust_run_pip install -e "$VLLM_HUST_REPO" --no-build-isolation --no-deps
           bash scripts/install_local_ascend_plugin.sh "$GITHUB_WORKSPACE"
-          python3 -m pip install -e "${VLLM_HUST_BENCHMARK_REPO}[publish]" jsonschema
+          hust_run_pip install -e "${VLLM_HUST_BENCHMARK_REPO}[publish]" jsonschema
 
       - name: Verify installation
         run: |

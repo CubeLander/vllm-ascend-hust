@@ -83,27 +83,28 @@ if [[ ! -f "${PLUGIN_REPO}/pyproject.toml" ]]; then
   exit 1
 fi
 
-PYTHON_BIN="$(hust_resolve_python_bin 2>/dev/null)" || {
-  echo "[ERROR] Could not locate python3/python for plugin installation"
-  exit 1
-}
-
 echo "[INFO] Installing local vllm-ascend-hust plugin from: ${PLUGIN_REPO}"
 echo "[INFO] Using lightweight mode: COMPILE_CUSTOM_KERNELS=0, --no-deps"
 export COMPILE_CUSTOM_KERNELS="${COMPILE_CUSTOM_KERNELS:-0}"
 mkdir -p "${CURRENT_USER_CACHE_HOME}/pip" "${CURRENT_USER_CONFIG_HOME}"
 
-if ! env \
-  "HOME=${CURRENT_USER_HOME}" \
-  "XDG_CACHE_HOME=${CURRENT_USER_CACHE_HOME}" \
-  "XDG_CONFIG_HOME=${CURRENT_USER_CONFIG_HOME}" \
-  "PIP_CACHE_DIR=${CURRENT_USER_CACHE_HOME}/pip" \
-  "${PYTHON_BIN}" -m pip install -e "${PLUGIN_REPO}" --no-build-isolation --no-deps; then
+if ! (
+  export HOME="${CURRENT_USER_HOME}"
+  export XDG_CACHE_HOME="${CURRENT_USER_CACHE_HOME}"
+  export XDG_CONFIG_HOME="${CURRENT_USER_CONFIG_HOME}"
+  export PIP_CACHE_DIR="${CURRENT_USER_CACHE_HOME}/pip"
+  hust_run_pip install -e "${PLUGIN_REPO}" --no-build-isolation --no-deps
+); then
   echo "[WARN] Local editable install failed."
   echo "[WARN] Continue with currently installed vllm-ascend-hust package if present."
 fi
 
 echo "[INFO] Checking vLLM platform plugin entry points"
+PYTHON_BIN="$(hust_resolve_python_bin 2>/dev/null)" || {
+  echo "[ERROR] Could not locate python3/python for plugin verification"
+  exit 1
+}
+
 "${PYTHON_BIN}" - <<'PY'
 from importlib.metadata import entry_points
 
