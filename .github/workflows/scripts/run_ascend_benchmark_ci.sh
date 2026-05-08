@@ -63,6 +63,7 @@ export CI_HOME HOME XDG_CACHE_HOME XDG_CONFIG_HOME
 
 export PYTHONPATH="${VLLM_HUST_REPO}:${VLLM_HUST_BENCHMARK_REPO}/src${PYTHONPATH:+:${PYTHONPATH}}"
 VLLM_CLI=("${PYTHON_BIN}" -m vllm.entrypoints.cli.main)
+VLLM_SERVE=("${PYTHON_BIN}" -m vllm.entrypoints.openai.api_server)
 SERVER_READY_TIMEOUT_SECONDS=${SERVER_READY_TIMEOUT_SECONDS:-600}
 SERVER_READY_POLL_SECONDS=${SERVER_READY_POLL_SECONDS:-2}
 
@@ -90,7 +91,7 @@ cleanup() {
 
 start_server() {
   if command -v setsid >/dev/null 2>&1; then
-    setsid env VLLM_ASCEND_TORCH_PREFLIGHT=0 "${VLLM_CLI[@]}" serve "$MODEL_NAME" \
+    setsid env VLLM_ASCEND_TORCH_PREFLIGHT=0 "${VLLM_SERVE[@]}" "$MODEL_NAME" \
       --host "$HOST" \
       --port "$PORT" \
       --dtype "$DTYPE" \
@@ -100,7 +101,7 @@ start_server() {
     server_pid=$!
     server_group_pid=$server_pid
   else
-    env VLLM_ASCEND_TORCH_PREFLIGHT=0 "${VLLM_CLI[@]}" serve "$MODEL_NAME" \
+    env VLLM_ASCEND_TORCH_PREFLIGHT=0 "${VLLM_SERVE[@]}" "$MODEL_NAME" \
       --host "$HOST" \
       --port "$PORT" \
       --dtype "$DTYPE" \
