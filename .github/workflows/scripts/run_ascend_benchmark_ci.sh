@@ -174,8 +174,9 @@ fi
 
 mkdir -p "$RESULT_ROOT" "$SUBMISSIONS_ROOT" "$AGGREGATE_OUTPUT_DIR" "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME"
 
-select_idle_ascend_device() {
-  "${PYTHON_BIN}" - <<'PY'
+select_ascend_device() {
+  ASCEND_DEVICE_SELECTION_ATTEMPT="${1:-1}" "${PYTHON_BIN}" - <<'PY'
+import os
 import re
 import subprocess
 import sys
@@ -191,6 +192,11 @@ def parse_logical_map(mapping_output: str) -> dict[tuple[str, str], int]:
     if npu_id.isdigit() and chip_id.isdigit() and logical_id.isdigit():
       logical_map[(npu_id, chip_id)] = int(logical_id)
   return logical_map
+
+
+def list_logical_devices(mapping_output: str) -> list[int]:
+  logical_devices = set(parse_logical_map(mapping_output).values())
+  return sorted(logical_devices)
 
 
 def select_best_idle_device(mapping_output: str, info_output: str) -> int | None:
@@ -260,12 +266,22 @@ try:
 except Exception:
   sys.exit(0)
 
-if mapping_result.returncode != 0 or info_result.returncode != 0:
+if mapping_result.returncode != 0:
   sys.exit(0)
 
-selected_device = select_best_idle_device(mapping_result.stdout, info_result.stdout)
+selection_attempt = max(1, int(os.environ.get("ASCEND_DEVICE_SELECTION_ATTEMPT", "1")))
+
+selected_device = None
+if info_result.returncode == 0:
+  selected_device = select_best_idle_device(mapping_result.stdout, info_result.stdout)
 if selected_device is not None:
-  print(selected_device)
+  print(f"{selected_device}\tidle")
+  sys.exit(0)
+
+logical_devices = list_logical_devices(mapping_result.stdout)
+if logical_devices:
+  fallback_device = logical_devices[(selection_attempt - 1) % len(logical_devices)]
+  print(f"{fallback_device}\tfallback-round-robin")
 PY
 }
 
@@ -338,15 +354,6 @@ if [[ ! -f "$EFFECTIVE_CONSTRAINTS_FILE" ]]; then
   exit 2
 fi
 
-if [[ "$CHIP_COUNT" == "1" && -z "${ASCEND_RT_VISIBLE_DEVICES:-}" ]]; then
-  SELECTED_ASCEND_DEVICE="$(select_idle_ascend_device)"
-  if [[ -n "$SELECTED_ASCEND_DEVICE" ]]; then
-    export ASCEND_RT_VISIBLE_DEVICES="$SELECTED_ASCEND_DEVICE"
-    export VLLM_ASCEND_TORCH_PREFLIGHT_DEVICE="npu:0"
-    echo "selected single-card Ascend device: $ASCEND_RT_VISIBLE_DEVICES"
-  fi
-fi
-
 server_ready_max_attempts=$(((SERVER_READY_TIMEOUT_SECONDS + SERVER_READY_POLL_SECONDS - 1) / SERVER_READY_POLL_SECONDS))
 if (( server_ready_max_attempts < 1 )); then
   server_ready_max_attempts=1
@@ -356,11 +363,16 @@ server_ready=0
 
 for start_attempt in $(seq 1 "$SERVER_START_RETRIES"); do
   if [[ "$CHIP_COUNT" == "1" ]]; then
-    SELECTED_ASCEND_DEVICE="$(select_idle_ascend_device)"
-    if [[ -n "$SELECTED_ASCEND_DEVICE" ]]; then
+    SELECTED_ASCEND_DEVICE_INFO="$(select_ascend_device "$start_attempt")"
+    if [[ -n "$SELECTED_ASCEND_DEVICE_INFO" ]]; then
+      IFS=$'\t' read -r SELECTED_ASCEND_DEVICE SELECTED_ASCEND_DEVICE_SOURCE <<<"$SELECTED_ASCEND_DEVICE_INFO"
       export ASCEND_RT_VISIBLE_DEVICES="$SELECTED_ASCEND_DEVICE"
       export VLLM_ASCEND_TORCH_PREFLIGHT_DEVICE="npu:0"
-      echo "selected single-card Ascend device: $ASCEND_RT_VISIBLE_DEVICES"
+      echo "selected single-card Ascend device: $ASCEND_RT_VISIBLE_DEVICES (${SELECTED_ASCEND_DEVICE_SOURCE})"
+    else
+      unset ASCEND_RT_VISIBLE_DEVICES
+      unset VLLM_ASCEND_TORCH_PREFLIGHT_DEVICE
+      echo "Could not resolve a single-card Ascend device; probing runtime without device scoping"
     fi
   fi
 
