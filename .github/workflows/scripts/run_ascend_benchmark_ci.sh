@@ -68,6 +68,8 @@ SERVER_READY_TIMEOUT_SECONDS=${SERVER_READY_TIMEOUT_SECONDS:-600}
 SERVER_READY_POLL_SECONDS=${SERVER_READY_POLL_SECONDS:-2}
 SERVER_START_RETRIES=${SERVER_START_RETRIES:-3}
 SERVER_START_RETRY_DELAY_SECONDS=${SERVER_START_RETRY_DELAY_SECONDS:-20}
+ASCEND_RUNTIME_READY_TIMEOUT_SECONDS=${ASCEND_RUNTIME_READY_TIMEOUT_SECONDS:-120}
+ASCEND_RUNTIME_READY_POLL_SECONDS=${ASCEND_RUNTIME_READY_POLL_SECONDS:-10}
 
 server_pid=""
 server_group_pid=""
@@ -96,6 +98,37 @@ cleanup() {
 
 server_log_indicates_resource_busy() {
   grep -qE 'Resource_Busy\(EL0005\)|aclInit, error code is 507899|The resources are busy' "$SERVER_LOG"
+}
+
+wait_for_ascend_runtime_ready() {
+  local max_attempts
+  max_attempts=$(((ASCEND_RUNTIME_READY_TIMEOUT_SECONDS + ASCEND_RUNTIME_READY_POLL_SECONDS - 1) / ASCEND_RUNTIME_READY_POLL_SECONDS))
+  if (( max_attempts < 1 )); then
+    max_attempts=1
+  fi
+
+  for runtime_attempt in $(seq 1 "$max_attempts"); do
+    if "${PYTHON_BIN}" - <<'PY'
+import sys
+
+try:
+    import torch_npu
+    torch_npu.npu.get_soc_version()
+except Exception as exc:
+    print(exc, file=sys.stderr)
+    raise SystemExit(1)
+PY
+    then
+      return 0
+    fi
+
+    if [[ "$runtime_attempt" -eq "$max_attempts" ]]; then
+      return 1
+    fi
+
+    echo "Ascend runtime not ready yet; waiting ${ASCEND_RUNTIME_READY_POLL_SECONDS}s before retrying device initialization (${runtime_attempt}/${max_attempts})"
+    sleep "$ASCEND_RUNTIME_READY_POLL_SECONDS"
+  done
 }
 
 start_server() {
@@ -329,6 +362,16 @@ for start_attempt in $(seq 1 "$SERVER_START_RETRIES"); do
       export VLLM_ASCEND_TORCH_PREFLIGHT_DEVICE="npu:0"
       echo "selected single-card Ascend device: $ASCEND_RT_VISIBLE_DEVICES"
     fi
+  fi
+
+  if ! wait_for_ascend_runtime_ready; then
+    echo "Ascend runtime did not become ready after ${ASCEND_RUNTIME_READY_TIMEOUT_SECONDS}s"
+    if [[ "$start_attempt" -lt "$SERVER_START_RETRIES" ]]; then
+      echo "Retrying server start after runtime readiness failure in ${SERVER_START_RETRY_DELAY_SECONDS}s (attempt ${start_attempt}/${SERVER_START_RETRIES})"
+      sleep "$SERVER_START_RETRY_DELAY_SECONDS"
+      continue
+    fi
+    exit 1
   fi
 
   start_server
