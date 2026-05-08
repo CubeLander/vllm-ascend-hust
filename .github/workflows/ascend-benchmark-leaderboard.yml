@@ -258,15 +258,15 @@ jobs:
         run: |
           mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME"
           source scripts/use_single_ascend_env.sh
-          python -m pip install -e "$VLLM_HUST_REPO" --no-build-isolation --no-deps
+          python3 -m pip install -e "$VLLM_HUST_REPO" --no-build-isolation --no-deps
           bash scripts/install_local_ascend_plugin.sh "$GITHUB_WORKSPACE"
-          python -m pip install -e "${VLLM_HUST_BENCHMARK_REPO}[publish]" jsonschema
+          python3 -m pip install -e "${VLLM_HUST_BENCHMARK_REPO}[publish]" jsonschema
 
       - name: Verify installation
         run: |
           source scripts/use_single_ascend_env.sh
-          python --version
-          python - <<'PY'
+          python3 --version
+          python3 - <<'PY'
           import vllm
           from vllm_ascend._version import __version__ as plugin_version
 
