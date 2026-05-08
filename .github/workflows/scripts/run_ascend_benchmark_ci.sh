@@ -66,6 +66,8 @@ VLLM_CLI=("${PYTHON_BIN}" -m vllm.entrypoints.cli.main)
 VLLM_SERVE=("${PYTHON_BIN}" -m vllm.entrypoints.openai.api_server)
 SERVER_READY_TIMEOUT_SECONDS=${SERVER_READY_TIMEOUT_SECONDS:-600}
 SERVER_READY_POLL_SECONDS=${SERVER_READY_POLL_SECONDS:-2}
+SERVER_START_RETRIES=${SERVER_START_RETRIES:-3}
+SERVER_START_RETRY_DELAY_SECONDS=${SERVER_START_RETRY_DELAY_SECONDS:-20}
 
 server_pid=""
 server_group_pid=""
@@ -87,6 +89,13 @@ cleanup() {
   if [[ -n "$server_pid" ]]; then
     wait "$server_pid" || true
   fi
+
+  server_pid=""
+  server_group_pid=""
+}
+
+server_log_indicates_resource_busy() {
+  grep -qE 'Resource_Busy\(EL0005\)|aclInit, error code is 507899|The resources are busy' "$SERVER_LOG"
 }
 
 start_server() {
@@ -303,32 +312,64 @@ if [[ "$CHIP_COUNT" == "1" && -z "${ASCEND_RT_VISIBLE_DEVICES:-}" ]]; then
   fi
 fi
 
-start_server
-
 server_ready_max_attempts=$(((SERVER_READY_TIMEOUT_SECONDS + SERVER_READY_POLL_SECONDS - 1) / SERVER_READY_POLL_SECONDS))
 if (( server_ready_max_attempts < 1 )); then
   server_ready_max_attempts=1
 fi
 
-for attempt in $(seq 1 "$server_ready_max_attempts"); do
-  if curl -fsS "http://$HOST:$PORT/v1/models" >/dev/null; then
-    break
+server_ready=0
+
+for start_attempt in $(seq 1 "$SERVER_START_RETRIES"); do
+  if [[ "$CHIP_COUNT" == "1" ]]; then
+    SELECTED_ASCEND_DEVICE="$(select_idle_ascend_device)"
+    if [[ -n "$SELECTED_ASCEND_DEVICE" ]]; then
+      export ASCEND_RT_VISIBLE_DEVICES="$SELECTED_ASCEND_DEVICE"
+      export VLLM_ASCEND_TORCH_PREFLIGHT_DEVICE="npu:0"
+      echo "selected single-card Ascend device: $ASCEND_RT_VISIBLE_DEVICES"
+    fi
   fi
 
-  if ! kill -0 "$server_pid" 2>/dev/null; then
-    echo "vLLM server exited before becoming ready"
-    cat "$SERVER_LOG"
-    exit 1
-  fi
+  start_server
 
-  if [[ "$attempt" -eq "$server_ready_max_attempts" ]]; then
-    echo "Timed out waiting for vLLM server to become ready after ${SERVER_READY_TIMEOUT_SECONDS}s"
-    cat "$SERVER_LOG"
-    exit 1
-  fi
+  for attempt in $(seq 1 "$server_ready_max_attempts"); do
+    if curl -fsS "http://$HOST:$PORT/v1/models" >/dev/null; then
+      server_ready=1
+      break 2
+    fi
 
-  sleep "$SERVER_READY_POLL_SECONDS"
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+      echo "vLLM server exited before becoming ready"
+      cat "$SERVER_LOG"
+      if [[ "$start_attempt" -lt "$SERVER_START_RETRIES" ]] && server_log_indicates_resource_busy; then
+        echo "Detected transient Ascend resource busy state; retrying server start in ${SERVER_START_RETRY_DELAY_SECONDS}s (attempt ${start_attempt}/${SERVER_START_RETRIES})"
+        cleanup
+        sleep "$SERVER_START_RETRY_DELAY_SECONDS"
+        break
+      fi
+      exit 1
+    fi
+
+    if [[ "$attempt" -eq "$server_ready_max_attempts" ]]; then
+      echo "Timed out waiting for vLLM server to become ready after ${SERVER_READY_TIMEOUT_SECONDS}s"
+      cat "$SERVER_LOG"
+      if [[ "$start_attempt" -lt "$SERVER_START_RETRIES" ]] && server_log_indicates_resource_busy; then
+        echo "Detected transient Ascend resource busy state after timeout; retrying server start in ${SERVER_START_RETRY_DELAY_SECONDS}s (attempt ${start_attempt}/${SERVER_START_RETRIES})"
+        cleanup
+        sleep "$SERVER_START_RETRY_DELAY_SECONDS"
+        break
+      fi
+      exit 1
+    fi
+
+    sleep "$SERVER_READY_POLL_SECONDS"
+  done
 done
+
+if [[ "$server_ready" != "1" ]]; then
+  echo "vLLM server did not become ready after ${SERVER_START_RETRIES} start attempt(s)"
+  cat "$SERVER_LOG"
+  exit 1
+fi
 
 "${VLLM_CLI[@]}" bench serve \
   --model "$MODEL_NAME" \
