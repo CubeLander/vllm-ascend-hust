@@ -5,9 +5,37 @@ _HUST_MANAGER_REPO_ROOT="$(cd "${_HUST_MANAGER_HELPER_DIR}/.." && pwd)"
 _HUST_MANAGER_WORKSPACE_ROOT="$(cd "${_HUST_MANAGER_REPO_ROOT}/.." && pwd)"
 _HUST_DEFAULT_HF_ENDPOINT="${HUST_DEFAULT_HF_ENDPOINT:-https://hf-mirror.com}"
 
+_resolve_hust_ascend_manager_conda_python() {
+  local env_prefix="${VLLM_HUST_CONDA_PREFIX:-}"
+  local env_name="${VLLM_HUST_CONDA_ENV:-vllm-hust-dev}"
+  local resolved_prefix
+
+  if [[ -n "${env_prefix}" && -x "${env_prefix}/bin/python" ]]; then
+    printf '%s\n' "${env_prefix}/bin/python"
+    return 0
+  fi
+
+  if ! command -v conda >/dev/null 2>&1; then
+    return 1
+  fi
+
+  resolved_prefix="$(conda env list 2>/dev/null | awk -v env_name="${env_name}" '$1 == env_name {print $NF; exit}')"
+  if [[ -n "${resolved_prefix}" && -x "${resolved_prefix}/bin/python" ]]; then
+    printf '%s\n' "${resolved_prefix}/bin/python"
+    return 0
+  fi
+
+  return 1
+}
+
 _resolve_hust_ascend_manager_python() {
   if [[ -n "${VLLM_HUST_PYTHON_BIN:-}" ]]; then
     printf '%s\n' "${VLLM_HUST_PYTHON_BIN}"
+    return 0
+  fi
+
+  if _resolve_hust_ascend_manager_conda_python >/dev/null 2>&1; then
+    _resolve_hust_ascend_manager_conda_python
     return 0
   fi
 
@@ -29,6 +57,22 @@ hust_resolve_python_bin() {
 }
 
 hust_run_pip() {
+  local python_bin
+  python_bin="$(_resolve_hust_ascend_manager_python 2>/dev/null)" || python_bin=""
+
+  if [[ -n "${python_bin}" ]]; then
+    if ! "${python_bin}" -m pip --version >/dev/null 2>&1; then
+      if ! "${python_bin}" -m ensurepip --upgrade >/dev/null 2>&1; then
+        python_bin=""
+      fi
+    fi
+  fi
+
+  if [[ -n "${python_bin}" ]]; then
+    "${python_bin}" -m pip "$@"
+    return $?
+  fi
+
   if command -v pip >/dev/null 2>&1; then
     pip "$@"
     return $?
@@ -39,7 +83,6 @@ hust_run_pip() {
     return $?
   fi
 
-  local python_bin
   python_bin="$(_resolve_hust_ascend_manager_python 2>/dev/null)" || {
     echo "[ERROR] Could not locate python3/python for pip operations" >&2
     return 1
