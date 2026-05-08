@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 WORKSPACE_ROOT=${WORKSPACE_ROOT:-${GITHUB_WORKSPACE:-$PWD}}
 VLLM_HUST_REPO=${VLLM_HUST_REPO:-$WORKSPACE_ROOT/vllm-hust}
 VLLM_ASCEND_HUST_REPO=${VLLM_ASCEND_HUST_REPO:-$WORKSPACE_ROOT}
@@ -45,6 +46,14 @@ CHIP_COUNT=${CHIP_COUNT:-1}
 NODE_COUNT=${NODE_COUNT:-1}
 PUBLISH_TO_HF=${PUBLISH_TO_HF:-0}
 HF_REPO_ID=${HF_REPO_ID:-}
+
+# shellcheck source=/dev/null
+source "${VLLM_ASCEND_HUST_REPO}/scripts/hust_ascend_manager_helper.sh"
+
+PYTHON_BIN="$(hust_resolve_python_bin 2>/dev/null)" || {
+  echo "Could not locate python3/python for benchmark workflow" >&2
+  exit 1
+}
 
 server_pid=""
 server_group_pid=""
@@ -92,7 +101,7 @@ start_server() {
 }
 
 allocate_local_port() {
-  python - <<'PY'
+  "${PYTHON_BIN}" - <<'PY'
 import socket
 
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -110,7 +119,7 @@ fi
 mkdir -p "$RESULT_ROOT" "$SUBMISSIONS_ROOT" "$AGGREGATE_OUTPUT_DIR"
 
 select_idle_ascend_device() {
-  python - <<'PY'
+  "${PYTHON_BIN}" - <<'PY'
 import re
 import subprocess
 import sys
@@ -313,13 +322,13 @@ vllm bench serve \
   --result-dir "$RESULT_ROOT" \
   --result-filename "$(basename "$RAW_RESULT_FILE")"
 
-CORE_VERSION=$(python - <<'PY'
+CORE_VERSION=$("${PYTHON_BIN}" - <<'PY'
 import vllm
 print(vllm.__version__)
 PY
 )
 
-BACKEND_VERSION=$(python - <<'PY'
+BACKEND_VERSION=$("${PYTHON_BIN}" - <<'PY'
 from vllm_ascend._version import __version__
 print(__version__)
 PY
@@ -327,7 +336,7 @@ PY
 
 ENGINE_VERSION="$ASCEND_HUST_TARGET_SHA_SHORT"
 
-python -m vllm_hust_benchmark.cli submit \
+"${PYTHON_BIN}" -m vllm_hust_benchmark.cli submit \
   "$BENCH_SCENARIO" \
   --benchmark-result-file "$RAW_RESULT_FILE" \
   --constraints-file "$EFFECTIVE_CONSTRAINTS_FILE" \
@@ -361,7 +370,7 @@ if [[ "$PUBLISH_TO_HF" == "1" ]]; then
     exit 2
   fi
 
-  python -m vllm_hust_benchmark.cli sync-submission-to-hf \
+  "${PYTHON_BIN}" -m vllm_hust_benchmark.cli sync-submission-to-hf \
     --submission-dir "$SUBMISSION_DIR" \
     --aggregate-output-dir "$AGGREGATE_OUTPUT_DIR" \
     --repo-id "$HF_REPO_ID" \
@@ -369,7 +378,7 @@ if [[ "$PUBLISH_TO_HF" == "1" ]]; then
     --commit-message "chore: sync vllm-hust benchmark from vllm-ascend-hust $RUN_ID (${ASCEND_HUST_TARGET_REPOSITORY}@${ASCEND_HUST_TARGET_REF}:${ASCEND_HUST_TARGET_SHA_SHORT})" \
     --execute
 else
-  python -m vllm_hust_benchmark.cli publish-website \
+  "${PYTHON_BIN}" -m vllm_hust_benchmark.cli publish-website \
     --source-dir "$SUBMISSIONS_ROOT" \
     --output-dir "$AGGREGATE_OUTPUT_DIR" \
     --execute

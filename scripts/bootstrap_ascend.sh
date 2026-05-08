@@ -14,6 +14,11 @@ MANAGER_PYPI_SPEC="${HUST_ASCEND_MANAGER_PYPI_SPEC:-hust-ascend-manager}"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/hust_ascend_manager_helper.sh"
 
+PYTHON_BIN="$(hust_resolve_python_bin 2>/dev/null)" || {
+  echo "[ERROR] Could not locate python3/python for Ascend bootstrap" >&2
+  exit 1
+}
+
 hust_apply_default_hf_mirror
 
 if [[ $# -gt 0 ]]; then
@@ -25,9 +30,9 @@ cd "${ASCEND_REPO_ROOT}"
 
 if ! command -v hust-ascend-manager >/dev/null 2>&1 && ! hust_ascend_manager_available; then
   if [[ -f "${MANAGER_REPO}/pyproject.toml" ]]; then
-    python -m pip install -e "${MANAGER_REPO}" --no-deps
+    "${PYTHON_BIN}" -m pip install -e "${MANAGER_REPO}" --no-deps
   else
-    python -m pip install --upgrade "${MANAGER_PYPI_SPEC}"
+    "${PYTHON_BIN}" -m pip install --upgrade "${MANAGER_PYPI_SPEC}"
   fi
 fi
 

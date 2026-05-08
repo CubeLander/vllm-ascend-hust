@@ -14,6 +14,9 @@ PLUGIN_REPO="${1:-${ASCEND_REPO_ROOT}}"
 CURRENT_USER_NAME="$(id -un 2>/dev/null || printf '%s' "${USER:-}")"
 CURRENT_USER_HOME="$(getent passwd "$CURRENT_USER_NAME" 2>/dev/null | cut -d: -f6 || true)"
 
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/hust_ascend_manager_helper.sh"
+
 resolve_writable_dir() {
   local candidate
   local parent_dir
@@ -80,6 +83,11 @@ if [[ ! -f "${PLUGIN_REPO}/pyproject.toml" ]]; then
   exit 1
 fi
 
+PYTHON_BIN="$(hust_resolve_python_bin 2>/dev/null)" || {
+  echo "[ERROR] Could not locate python3/python for plugin installation"
+  exit 1
+}
+
 echo "[INFO] Installing local vllm-ascend-hust plugin from: ${PLUGIN_REPO}"
 echo "[INFO] Using lightweight mode: COMPILE_CUSTOM_KERNELS=0, --no-deps"
 export COMPILE_CUSTOM_KERNELS="${COMPILE_CUSTOM_KERNELS:-0}"
@@ -90,13 +98,13 @@ if ! env \
   "XDG_CACHE_HOME=${CURRENT_USER_CACHE_HOME}" \
   "XDG_CONFIG_HOME=${CURRENT_USER_CONFIG_HOME}" \
   "PIP_CACHE_DIR=${CURRENT_USER_CACHE_HOME}/pip" \
-  python -m pip install -e "${PLUGIN_REPO}" --no-build-isolation --no-deps; then
+  "${PYTHON_BIN}" -m pip install -e "${PLUGIN_REPO}" --no-build-isolation --no-deps; then
   echo "[WARN] Local editable install failed."
   echo "[WARN] Continue with currently installed vllm-ascend-hust package if present."
 fi
 
 echo "[INFO] Checking vLLM platform plugin entry points"
-python - <<'PY'
+"${PYTHON_BIN}" - <<'PY'
 from importlib.metadata import entry_points
 
 eps = entry_points(group="vllm.platform_plugins")

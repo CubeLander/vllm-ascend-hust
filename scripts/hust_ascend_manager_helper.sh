@@ -24,6 +24,10 @@ _resolve_hust_ascend_manager_python() {
   return 1
 }
 
+hust_resolve_python_bin() {
+  _resolve_hust_ascend_manager_python "$@"
+}
+
 _resolve_hust_ascend_manager_src() {
   local manager_repo="${HUST_ASCEND_MANAGER_REPO:-${_HUST_MANAGER_WORKSPACE_ROOT}/ascend-runtime-manager}"
   local manager_src="${manager_repo}/src"
