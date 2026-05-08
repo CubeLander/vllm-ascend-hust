@@ -55,8 +55,16 @@ PYTHON_BIN="$(hust_resolve_python_bin 2>/dev/null)" || {
   exit 1
 }
 
+CI_HOME=${CI_HOME:-$WORKSPACE_ROOT/.ci-home}
+HOME=$CI_HOME
+XDG_CACHE_HOME=${XDG_CACHE_HOME:-$CI_HOME/.cache}
+XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-$CI_HOME/.config}
+export CI_HOME HOME XDG_CACHE_HOME XDG_CONFIG_HOME
+
 export PYTHONPATH="${VLLM_HUST_REPO}:${VLLM_HUST_BENCHMARK_REPO}/src${PYTHONPATH:+:${PYTHONPATH}}"
 VLLM_CLI=("${PYTHON_BIN}" -m vllm.entrypoints.cli.main)
+SERVER_READY_TIMEOUT_SECONDS=${SERVER_READY_TIMEOUT_SECONDS:-600}
+SERVER_READY_POLL_SECONDS=${SERVER_READY_POLL_SECONDS:-2}
 
 server_pid=""
 server_group_pid=""
@@ -119,7 +127,7 @@ if [[ -z "$PORT" ]]; then
   PORT=$(allocate_local_port)
 fi
 
-mkdir -p "$RESULT_ROOT" "$SUBMISSIONS_ROOT" "$AGGREGATE_OUTPUT_DIR"
+mkdir -p "$RESULT_ROOT" "$SUBMISSIONS_ROOT" "$AGGREGATE_OUTPUT_DIR" "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME"
 
 select_idle_ascend_device() {
   "${PYTHON_BIN}" - <<'PY'
@@ -296,7 +304,12 @@ fi
 
 start_server
 
-for attempt in $(seq 1 120); do
+server_ready_max_attempts=$(((SERVER_READY_TIMEOUT_SECONDS + SERVER_READY_POLL_SECONDS - 1) / SERVER_READY_POLL_SECONDS))
+if (( server_ready_max_attempts < 1 )); then
+  server_ready_max_attempts=1
+fi
+
+for attempt in $(seq 1 "$server_ready_max_attempts"); do
   if curl -fsS "http://$HOST:$PORT/v1/models" >/dev/null; then
     break
   fi
@@ -307,13 +320,13 @@ for attempt in $(seq 1 120); do
     exit 1
   fi
 
-  if [[ "$attempt" -eq 120 ]]; then
-    echo "Timed out waiting for vLLM server to become ready"
+  if [[ "$attempt" -eq "$server_ready_max_attempts" ]]; then
+    echo "Timed out waiting for vLLM server to become ready after ${SERVER_READY_TIMEOUT_SECONDS}s"
     cat "$SERVER_LOG"
     exit 1
   fi
 
-  sleep 2
+  sleep "$SERVER_READY_POLL_SECONDS"
 done
 
 "${VLLM_CLI[@]}" bench serve \
