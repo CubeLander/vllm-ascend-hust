@@ -8,6 +8,11 @@ _HUST_DEFAULT_HF_ENDPOINT="${HUST_DEFAULT_HF_ENDPOINT:-https://hf-mirror.com}"
 _resolve_hust_ascend_manager_conda_python() {
   local env_prefix="${VLLM_HUST_CONDA_PREFIX:-}"
   local env_name="${VLLM_HUST_CONDA_ENV:-vllm-hust-dev}"
+  local current_user_name
+  local current_user_home
+  local conda_bin
+  local conda_root
+  local candidate_prefix
   local resolved_prefix
 
   if [[ -n "${env_prefix}" && -x "${env_prefix}/bin/python" ]]; then
@@ -15,15 +20,50 @@ _resolve_hust_ascend_manager_conda_python() {
     return 0
   fi
 
-  if ! command -v conda >/dev/null 2>&1; then
-    return 1
+  current_user_name="$(id -un 2>/dev/null || printf '%s' "${USER:-}")"
+  current_user_home="$(getent passwd "${current_user_name}" 2>/dev/null | cut -d: -f6 || true)"
+
+  if [[ -n "${current_user_home}" ]]; then
+    for candidate_prefix in \
+      "${current_user_home}/miniconda3/envs/${env_name}" \
+      "${current_user_home}/anaconda3/envs/${env_name}" \
+      "${current_user_home}/mambaforge/envs/${env_name}" \
+      "${current_user_home}/miniforge3/envs/${env_name}"; do
+      if [[ -x "${candidate_prefix}/bin/python" ]]; then
+        printf '%s\n' "${candidate_prefix}/bin/python"
+        return 0
+      fi
+    done
   fi
 
-  resolved_prefix="$(conda env list 2>/dev/null | awk -v env_name="${env_name}" '$1 == env_name {print $NF; exit}')"
-  if [[ -n "${resolved_prefix}" && -x "${resolved_prefix}/bin/python" ]]; then
-    printf '%s\n' "${resolved_prefix}/bin/python"
-    return 0
+  if command -v conda >/dev/null 2>&1; then
+    resolved_prefix="$(conda env list 2>/dev/null | awk -v env_name="${env_name}" '$1 == env_name {print $NF; exit}')"
+    if [[ -n "${resolved_prefix}" && -x "${resolved_prefix}/bin/python" ]]; then
+      printf '%s\n' "${resolved_prefix}/bin/python"
+      return 0
+    fi
+
+    conda_bin="$(command -v conda)"
+    conda_root="$(cd "$(dirname "${conda_bin}")/.." && pwd)"
+    for candidate_prefix in \
+      "${conda_root}/envs/${env_name}" \
+      "${conda_root}/../envs/${env_name}"; do
+      if [[ -x "${candidate_prefix}/bin/python" ]]; then
+        printf '%s\n' "${candidate_prefix}/bin/python"
+        return 0
+      fi
+    done
   fi
+
+  for candidate_prefix in \
+    "/opt/conda/envs/${env_name}" \
+    "/usr/local/miniconda3/envs/${env_name}" \
+    "/usr/local/anaconda3/envs/${env_name}"; do
+    if [[ -x "${candidate_prefix}/bin/python" ]]; then
+      printf '%s\n' "${candidate_prefix}/bin/python"
+      return 0
+    fi
+  done
 
   return 1
 }
