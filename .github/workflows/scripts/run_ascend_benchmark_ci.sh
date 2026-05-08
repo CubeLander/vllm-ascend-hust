@@ -223,6 +223,27 @@ def list_logical_devices(mapping_output: str) -> list[int]:
   return sorted(logical_devices)
 
 
+def run_npu_smi(*args: str) -> subprocess.CompletedProcess[str] | None:
+  npu_smi_bin = os.environ.get("NPU_SMI_BIN")
+  if not npu_smi_bin:
+    return None
+
+  try:
+    return subprocess.run(
+      [npu_smi_bin, *args],
+      check=False,
+      capture_output=True,
+      text=True,
+      timeout=5,
+    )
+  except subprocess.TimeoutExpired:
+    print(f"npu-smi {' '.join(args)} timed out after 5s", file=sys.stderr)
+    return None
+  except Exception as exc:
+    print(f"npu-smi {' '.join(args)} failed: {exc}", file=sys.stderr)
+    return None
+
+
 def select_best_idle_device(mapping_output: str, info_output: str) -> int | None:
   logical_map = parse_logical_map(mapping_output)
   hbm_usage_pattern = re.compile(r"(\d+)\s*/\s*(\d+)\s*$")
@@ -271,37 +292,22 @@ def select_best_idle_device(mapping_output: str, info_output: str) -> int | None
   device_stats.sort(key=lambda item: (-item[1], item[0]))
   return device_stats[0][0]
 
-
-try:
-  npu_smi_bin = os.environ.get("NPU_SMI_BIN")
-  if not npu_smi_bin:
-    sys.exit(0)
-
-  mapping_result = subprocess.run(
-    [npu_smi_bin, "info", "-m"],
-    check=False,
-    capture_output=True,
-    text=True,
-    timeout=5,
-  )
-  info_result = subprocess.run(
-    [npu_smi_bin, "info"],
-    check=False,
-    capture_output=True,
-    text=True,
-    timeout=5,
-  )
-except Exception:
+mapping_result = run_npu_smi("info", "-m")
+if mapping_result is None:
   sys.exit(0)
 
 if mapping_result.returncode != 0:
+  print(f"npu-smi info -m returned {mapping_result.returncode}: {mapping_result.stderr.strip()}", file=sys.stderr)
   sys.exit(0)
 
 selection_attempt = max(1, int(os.environ.get("ASCEND_DEVICE_SELECTION_ATTEMPT", "1")))
 
 selected_device = None
-if info_result.returncode == 0:
+info_result = run_npu_smi("info")
+if info_result is not None and info_result.returncode == 0:
   selected_device = select_best_idle_device(mapping_result.stdout, info_result.stdout)
+elif info_result is not None:
+  print(f"npu-smi info returned {info_result.returncode}: {info_result.stderr.strip()}", file=sys.stderr)
 if selected_device is not None:
   print(f"{selected_device}\tidle")
   sys.exit(0)
