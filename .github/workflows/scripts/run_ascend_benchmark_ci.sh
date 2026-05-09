@@ -281,6 +281,7 @@ run_same_spec_current_benchmark() {
     VLLM_HUST_WORKSPACE_ROOT="$WORKSPACE_ROOT" \
     CURRENT_RUNTIME_CWD=/tmp \
     CURRENT_RUNTIME_PYTHON="$PYTHON_BIN" \
+    CURRENT_MODEL_PATH="$MODEL_NAME" \
     CURRENT_VLLM_HUST_REPO="$VLLM_HUST_REPO" \
     CURRENT_VLLM_ASCEND_HUST_REPO="$VLLM_ASCEND_HUST_REPO" \
     CURRENT_VLLM_CACHE_ROOT="$CI_RUNTIME_ROOT/current-ascend-same-spec-cache" \
@@ -608,8 +609,9 @@ if [[ "$BENCH_SCENARIO" == "random-online" && "$SAME_SPEC_BENCHMARK_ENABLED" == 
 
     if run_same_spec_current_benchmark; then
       break
+    else
+      same_spec_exit_code=$?
     fi
-    same_spec_exit_code=$?
     if same_spec_server_log_indicates_resource_busy; then
       if [[ "$start_attempt" -lt "$SERVER_START_RETRIES" ]]; then
         echo "Detected transient Ascend resource busy state during same-spec benchmark; retrying in ${SERVER_START_RETRY_DELAY_SECONDS}s (attempt ${start_attempt}/${SERVER_START_RETRIES})"
