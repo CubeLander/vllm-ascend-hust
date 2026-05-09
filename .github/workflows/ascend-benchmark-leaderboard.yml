@@ -300,9 +300,17 @@ jobs:
           VLLM_HUST_BENCHMARK_REPO: ${{ github.workspace }}/vllm-hust-benchmark
           VLLM_HUST_WEBSITE_REPO: ${{ github.workspace }}/vllm-hust-website
         run: |
-          source scripts/use_single_ascend_env.sh
           set +e
-          bash .github/workflows/scripts/run_ascend_benchmark_ci.sh
+          benchmark_lock_file="${ASCEND_BENCHMARK_LOCK_FILE:-/tmp/vllm-ascend-hust-benchmark.lock}"
+          mkdir -p "$(dirname "$benchmark_lock_file")"
+          if command -v flock >/dev/null 2>&1; then
+            echo "Acquiring Ascend benchmark host lock: $benchmark_lock_file"
+            flock "$benchmark_lock_file" bash -c 'source scripts/use_single_ascend_env.sh && bash .github/workflows/scripts/run_ascend_benchmark_ci.sh'
+          else
+            echo "flock is unavailable; running benchmark without host-level serialization"
+            source scripts/use_single_ascend_env.sh
+            bash .github/workflows/scripts/run_ascend_benchmark_ci.sh
+          fi
           benchmark_exit_code=$?
           set -e
 

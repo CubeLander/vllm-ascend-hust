@@ -19,6 +19,11 @@ SUBMISSIONS_ROOT=${SUBMISSIONS_ROOT:-$RESULT_ROOT/submissions}
 SUBMISSION_DIR=${SUBMISSION_DIR:-$SUBMISSIONS_ROOT/$RUN_ID}
 AGGREGATE_OUTPUT_DIR=${AGGREGATE_OUTPUT_DIR:-$RESULT_ROOT/leaderboard-data}
 SERVER_LOG=${SERVER_LOG:-$RESULT_ROOT/server.log}
+RUNTIME_READY_LOG=${RUNTIME_READY_LOG:-$RESULT_ROOT/runtime-ready.log}
+CI_RUNTIME_ROOT=${CI_RUNTIME_ROOT:-$WORKSPACE_ROOT/.ci-runtime}
+PROCESS_MARKER_DIR=${PROCESS_MARKER_DIR:-$CI_RUNTIME_ROOT/process-markers}
+SERVER_PID_MARKER=${SERVER_PID_MARKER:-$PROCESS_MARKER_DIR/ascend-benchmark-server.pid}
+SERVER_PGID_MARKER=${SERVER_PGID_MARKER:-$PROCESS_MARKER_DIR/ascend-benchmark-server.pgid}
 BENCH_SCENARIO=${BENCH_SCENARIO:-random-online}
 BENCH_DATASET_PATH=${BENCH_DATASET_PATH:-}
 BENCH_CONSTRAINTS_FILE=${BENCH_CONSTRAINTS_FILE:-}
@@ -95,10 +100,69 @@ cleanup() {
 
   server_pid=""
   server_group_pid=""
+  rm -f "$SERVER_PID_MARKER" "$SERVER_PGID_MARKER"
 }
 
 server_log_indicates_resource_busy() {
-  grep -qE 'Resource_Busy\(EL0005\)|aclInit, error code is 507899|The resources are busy' "$SERVER_LOG"
+  [[ -f "$SERVER_LOG" ]] && grep -qE 'Resource_Busy\(EL0005\)|aclInit, error code is 507899|The resources are busy' "$SERVER_LOG"
+}
+
+runtime_ready_log_indicates_resource_busy() {
+  [[ -f "$RUNTIME_READY_LOG" ]] && grep -qE 'Resource_Busy\(EL0005\)|aclInit, error code is 507899|The resources are busy' "$RUNTIME_READY_LOG"
+}
+
+cleanup_previous_ci_processes() {
+  local marker_pgid marker_pid remaining_matches remaining_pids
+
+  if [[ -f "$SERVER_PGID_MARKER" ]]; then
+    marker_pgid=$(tr -d '[:space:]' <"$SERVER_PGID_MARKER")
+    if [[ -n "$marker_pgid" ]] && kill -0 "$marker_pgid" 2>/dev/null; then
+      echo "Cleaning leftover Ascend benchmark process group: $marker_pgid"
+      kill -TERM -- "-$marker_pgid" 2>/dev/null || true
+      for _ in $(seq 1 10); do
+        if ! kill -0 "$marker_pgid" 2>/dev/null; then
+          break
+        fi
+        sleep 1
+      done
+      kill -KILL -- "-$marker_pgid" 2>/dev/null || true
+    fi
+  fi
+
+  if [[ -f "$SERVER_PID_MARKER" ]]; then
+    marker_pid=$(tr -d '[:space:]' <"$SERVER_PID_MARKER")
+    if [[ -n "$marker_pid" ]] && kill -0 "$marker_pid" 2>/dev/null; then
+      echo "Cleaning leftover Ascend benchmark process: $marker_pid"
+      kill "$marker_pid" 2>/dev/null || true
+    fi
+  fi
+
+  remaining_matches=$(ps -eo pid,ppid,pgid,sid,etimes,args \
+    | grep -F "$WORKSPACE_ROOT" \
+    | grep -E 'vllm|python|pytest' \
+    | grep -v grep || true)
+  if [[ -n "$remaining_matches" ]]; then
+    echo "Remaining workspace-scoped vLLM/Python processes before benchmark:"
+    echo "$remaining_matches"
+    remaining_pids=$(printf '%s\n' "$remaining_matches" | awk '{print $1}')
+    if [[ -n "$remaining_pids" ]]; then
+      echo "Cleaning workspace-scoped leftover process(es): $remaining_pids"
+      # shellcheck disable=SC2086
+      kill -TERM $remaining_pids 2>/dev/null || true
+      for _ in $(seq 1 10); do
+        if ! ps -p "$(printf '%s' "$remaining_pids" | paste -sd, -)" >/dev/null 2>&1; then
+          break
+        fi
+        sleep 1
+      done
+      # shellcheck disable=SC2086
+      kill -KILL $remaining_pids 2>/dev/null || true
+    fi
+  else
+    echo "No leftover workspace-scoped vLLM/Python processes detected before benchmark."
+  fi
+
+  rm -f "$SERVER_PID_MARKER" "$SERVER_PGID_MARKER"
 }
 
 wait_for_ascend_runtime_ready() {
@@ -109,7 +173,7 @@ wait_for_ascend_runtime_ready() {
   fi
 
   for runtime_attempt in $(seq 1 "$max_attempts"); do
-    if "${PYTHON_BIN}" - <<'PY'
+    if "${PYTHON_BIN}" - <<'PY' >"$RUNTIME_READY_LOG" 2>&1
 import sys
 
 try:
@@ -123,7 +187,12 @@ PY
       return 0
     fi
 
+    cat "$RUNTIME_READY_LOG" >&2
+
     if [[ "$runtime_attempt" -eq "$max_attempts" ]]; then
+      if runtime_ready_log_indicates_resource_busy; then
+        return "$RESOURCE_BUSY_EXIT_CODE"
+      fi
       return 1
     fi
 
@@ -161,6 +230,8 @@ start_server() {
       --enforce-eager >"$SERVER_LOG" 2>&1 &
     server_pid=$!
     server_group_pid=$server_pid
+    printf '%s\n' "$server_pid" >"$SERVER_PID_MARKER"
+    printf '%s\n' "$server_group_pid" >"$SERVER_PGID_MARKER"
   else
     env VLLM_ASCEND_TORCH_PREFLIGHT=0 "${VLLM_SERVE[@]}" \
       --model "$MODEL_NAME" \
@@ -171,6 +242,7 @@ start_server() {
       --max-num-seqs "$MAX_NUM_SEQS" \
       --enforce-eager >"$SERVER_LOG" 2>&1 &
     server_pid=$!
+    printf '%s\n' "$server_pid" >"$SERVER_PID_MARKER"
   fi
 }
 
@@ -190,7 +262,8 @@ if [[ -z "$PORT" ]]; then
   PORT=$(allocate_local_port)
 fi
 
-mkdir -p "$RESULT_ROOT" "$SUBMISSIONS_ROOT" "$AGGREGATE_OUTPUT_DIR" "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME"
+mkdir -p "$RESULT_ROOT" "$SUBMISSIONS_ROOT" "$AGGREGATE_OUTPUT_DIR" "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$PROCESS_MARKER_DIR"
+cleanup_previous_ci_processes
 
 NPU_SMI_BIN="$(resolve_npu_smi_bin 2>/dev/null || true)"
 if [[ -n "$NPU_SMI_BIN" ]]; then
@@ -465,14 +538,24 @@ for start_attempt in $(seq 1 "$SERVER_START_RETRIES"); do
     fi
   fi
 
-  if ! wait_for_ascend_runtime_ready; then
+  if wait_for_ascend_runtime_ready; then
+    runtime_ready_status=0
+  else
+    runtime_ready_status=$?
+  fi
+
+  if [[ "$runtime_ready_status" -ne 0 ]]; then
     echo "Ascend runtime did not become ready after ${ASCEND_RUNTIME_READY_TIMEOUT_SECONDS}s"
     if [[ "$start_attempt" -lt "$SERVER_START_RETRIES" ]]; then
       echo "Retrying server start after runtime readiness failure in ${SERVER_START_RETRY_DELAY_SECONDS}s (attempt ${start_attempt}/${SERVER_START_RETRIES})"
       sleep "$SERVER_START_RETRY_DELAY_SECONDS"
       continue
     fi
-    exit 1
+    if [[ "$runtime_ready_status" -eq "$RESOURCE_BUSY_EXIT_CODE" ]]; then
+      echo "Detected transient Ascend resource busy state during runtime readiness after exhausting ${SERVER_START_RETRIES} start attempt(s)"
+      exit "$RESOURCE_BUSY_EXIT_CODE"
+    fi
+    exit "$runtime_ready_status"
   fi
 
   start_server
