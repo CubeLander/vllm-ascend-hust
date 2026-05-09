@@ -119,6 +119,7 @@ jobs:
       CHIP_COUNT: "1"
       NODE_COUNT: "1"
       ALLOW_RANDOM_HF_PUBLISH: ${{ vars.VLLM_ASCEND_HUST_ALLOW_RANDOM_HF_PUBLISH || '0' }}
+      SAME_SPEC_BENCHMARK_ENABLED: ${{ vars.VLLM_ASCEND_HUST_SAME_SPEC_BENCHMARK_ENABLED || '1' }}
       SYNC_GITHUB_SNAPSHOTS: ${{ vars.VLLM_ASCEND_HUST_SYNC_BENCHMARK_SNAPSHOTS_TO_GITHUB || '1' }}
       GITHUB_SNAPSHOT_TARGET_BRANCH: ${{ vars.VLLM_HUST_BENCHMARK_SNAPSHOT_BRANCH || 'main' }}
       WEBSITE_LEADERBOARD_URL: ${{ vars.VLLM_ASCEND_HUST_LEADERBOARD_URL || vars.VLLM_HUST_LEADERBOARD_URL || '' }}
@@ -318,7 +319,7 @@ jobs:
 
           echo "BENCHMARK_EXIT_CODE=$benchmark_exit_code" >> "$GITHUB_ENV"
 
-          if [[ "$benchmark_exit_code" -eq 75 && "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+          if [[ "$benchmark_exit_code" -eq 75 && "$GITHUB_EVENT_NAME" == "pull_request" && "${SAME_SPEC_BENCHMARK_ENABLED:-1}" != "1" ]]; then
             echo "Ascend benchmark hit shared-runner resource contention; treating this PR run as neutral instead of failing CI."
             exit 0
           fi
