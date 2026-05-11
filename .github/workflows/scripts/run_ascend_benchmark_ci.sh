@@ -178,10 +178,6 @@ build_ascend_command_prefix() {
   if [[ "$ASCEND_BENCHMARK_USE_SUDO" == "1" ]]; then
     local preserve_list
     preserve_list=$(build_sudo_env_preserve_list)
-    if ! sudo -n true 2>/dev/null; then
-      echo "ASCEND_BENCHMARK_USE_SUDO=1 but passwordless sudo is unavailable for benchmark commands" >&2
-      return 1
-    fi
     if [[ -n "$preserve_list" ]]; then
       printf 'sudo --preserve-env=%q -E -n' "$preserve_list"
     else
@@ -196,10 +192,6 @@ run_ascend_command() {
   if [[ "$ASCEND_BENCHMARK_USE_SUDO" == "1" ]]; then
     local preserve_list
     preserve_list=$(build_sudo_env_preserve_list)
-    if ! sudo -n true 2>/dev/null; then
-      echo "ASCEND_BENCHMARK_USE_SUDO=1 but passwordless sudo is unavailable for benchmark commands" >&2
-      return 1
-    fi
     if [[ -n "$preserve_list" ]]; then
       sudo --preserve-env="$preserve_list" -E -n "$@"
     else
