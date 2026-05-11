@@ -347,6 +347,7 @@ select_ascend_device() {
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 
@@ -410,21 +411,48 @@ def run_npu_smi(*args: str) -> subprocess.CompletedProcess[str] | None:
     "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH", ""),
   }
 
-  try:
-    return subprocess.run(
-      [npu_smi_bin, *args],
-      check=False,
-      capture_output=True,
-      text=True,
-      timeout=5,
-      env=clean_env,
-    )
-  except subprocess.TimeoutExpired:
-    print(f"npu-smi {' '.join(args)} timed out after 5s", file=sys.stderr)
-    return None
-  except Exception as exc:
-    print(f"npu-smi {' '.join(args)} failed: {exc}", file=sys.stderr)
-    return None
+  def invoke(command: list[str]) -> subprocess.CompletedProcess[str] | None:
+    try:
+      return subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        env=clean_env,
+      )
+    except subprocess.TimeoutExpired:
+      print(f"{' '.join(command)} timed out after 5s", file=sys.stderr)
+      return None
+    except Exception as exc:
+      print(f"{' '.join(command)} failed: {exc}", file=sys.stderr)
+      return None
+
+  result = invoke([npu_smi_bin, *args])
+  if result is None or result.returncode == 0 or os.geteuid() == 0:
+    return result
+
+  if os.environ.get("NPU_SMI_USE_SUDO_FALLBACK", "1") == "0":
+    return result
+
+  sudo_bin = shutil.which("sudo", path=clean_env["PATH"])
+  if not sudo_bin:
+    return result
+
+  sudo_result = invoke([sudo_bin, "-n", npu_smi_bin, *args])
+  if sudo_result is not None and sudo_result.returncode == 0:
+    print(f"npu-smi {' '.join(args)} succeeded via sudo fallback", file=sys.stderr)
+    return sudo_result
+
+  return result
+
+
+def format_npu_smi_failure(result: subprocess.CompletedProcess[str]) -> str:
+  stderr = (result.stderr or "").strip()
+  stdout = (result.stdout or "").strip()
+  if stderr and stdout:
+    return f"{stderr} | stdout: {stdout}"
+  return stderr or stdout or "<no output>"
 
 
 def select_best_idle_device(info_output: str, logical_map: dict[tuple[str, str], int]) -> tuple[int, str] | None:
@@ -486,7 +514,7 @@ if mapping_result is not None and mapping_result.returncode == 0:
   logical_map = parse_logical_map(mapping_result.stdout)
   logical_devices = list_status_devices(mapping_result.stdout)
 elif mapping_result is not None:
-  print(f"npu-smi info -m returned {mapping_result.returncode}: {mapping_result.stderr.strip()}", file=sys.stderr)
+  print(f"npu-smi info -m returned {mapping_result.returncode}: {format_npu_smi_failure(mapping_result)}", file=sys.stderr)
 
 selection_attempt = max(1, int(os.environ.get("ASCEND_DEVICE_SELECTION_ATTEMPT", "1")))
 
@@ -503,7 +531,7 @@ if info_result is not None and info_result.returncode == 0:
     print(f"{fallback_device}\tstatus-round-robin")
     sys.exit(0)
 elif info_result is not None:
-  print(f"npu-smi info returned {info_result.returncode}: {info_result.stderr.strip()}", file=sys.stderr)
+  print(f"npu-smi info returned {info_result.returncode}: {format_npu_smi_failure(info_result)}", file=sys.stderr)
 
 if logical_devices:
   fallback_device = logical_devices[(selection_attempt - 1) % len(logical_devices)]
@@ -515,6 +543,30 @@ if devnode_devices:
   fallback_device = devnode_devices[(selection_attempt - 1) % len(devnode_devices)]
   print(f"{fallback_device}\tdevnode-round-robin")
 PY
+}
+
+configure_single_card_ascend_device() {
+  local start_attempt="${1:-1}"
+  local selected_device_info=""
+
+  if [[ -n "${ASCEND_RT_VISIBLE_DEVICES:-}" ]]; then
+    export VLLM_ASCEND_TORCH_PREFLIGHT_DEVICE="${VLLM_ASCEND_TORCH_PREFLIGHT_DEVICE:-npu:0}"
+    echo "using explicit Ascend visible devices from environment: $ASCEND_RT_VISIBLE_DEVICES"
+    echo "skipping automatic single-card Ascend device selection"
+    return 0
+  fi
+
+  selected_device_info="$(select_ascend_device "$start_attempt" "$NPU_SMI_BIN")"
+  if [[ -n "$selected_device_info" ]]; then
+    IFS=$'\t' read -r SELECTED_ASCEND_DEVICE SELECTED_ASCEND_DEVICE_SOURCE <<<"$selected_device_info"
+    export ASCEND_RT_VISIBLE_DEVICES="$SELECTED_ASCEND_DEVICE"
+    export VLLM_ASCEND_TORCH_PREFLIGHT_DEVICE="npu:0"
+    echo "selected single-card Ascend device: $ASCEND_RT_VISIBLE_DEVICES (${SELECTED_ASCEND_DEVICE_SOURCE})"
+  else
+    unset ASCEND_RT_VISIBLE_DEVICES
+    unset VLLM_ASCEND_TORCH_PREFLIGHT_DEVICE
+    echo "Could not resolve a single-card Ascend device; probing runtime without device scoping"
+  fi
 }
 
 echo "== Ascend benchmark CI =="
@@ -594,17 +646,7 @@ fi
 if [[ "$BENCH_SCENARIO" == "random-online" && "$SAME_SPEC_BENCHMARK_ENABLED" == "1" ]]; then
   for start_attempt in $(seq 1 "$SERVER_START_RETRIES"); do
     if [[ "$CHIP_COUNT" == "1" ]]; then
-      SELECTED_ASCEND_DEVICE_INFO="$(select_ascend_device "$start_attempt" "$NPU_SMI_BIN")"
-      if [[ -n "$SELECTED_ASCEND_DEVICE_INFO" ]]; then
-        IFS=$'\t' read -r SELECTED_ASCEND_DEVICE SELECTED_ASCEND_DEVICE_SOURCE <<<"$SELECTED_ASCEND_DEVICE_INFO"
-        export ASCEND_RT_VISIBLE_DEVICES="$SELECTED_ASCEND_DEVICE"
-        export VLLM_ASCEND_TORCH_PREFLIGHT_DEVICE="npu:0"
-        echo "selected single-card Ascend device: $ASCEND_RT_VISIBLE_DEVICES (${SELECTED_ASCEND_DEVICE_SOURCE})"
-      else
-        unset ASCEND_RT_VISIBLE_DEVICES
-        unset VLLM_ASCEND_TORCH_PREFLIGHT_DEVICE
-        echo "Could not resolve a single-card Ascend device; probing runtime without device scoping"
-      fi
+      configure_single_card_ascend_device "$start_attempt"
     fi
 
     if run_same_spec_current_benchmark; then
@@ -633,17 +675,7 @@ else
 
   for start_attempt in $(seq 1 "$SERVER_START_RETRIES"); do
     if [[ "$CHIP_COUNT" == "1" ]]; then
-      SELECTED_ASCEND_DEVICE_INFO="$(select_ascend_device "$start_attempt" "$NPU_SMI_BIN")"
-      if [[ -n "$SELECTED_ASCEND_DEVICE_INFO" ]]; then
-        IFS=$'\t' read -r SELECTED_ASCEND_DEVICE SELECTED_ASCEND_DEVICE_SOURCE <<<"$SELECTED_ASCEND_DEVICE_INFO"
-        export ASCEND_RT_VISIBLE_DEVICES="$SELECTED_ASCEND_DEVICE"
-        export VLLM_ASCEND_TORCH_PREFLIGHT_DEVICE="npu:0"
-        echo "selected single-card Ascend device: $ASCEND_RT_VISIBLE_DEVICES (${SELECTED_ASCEND_DEVICE_SOURCE})"
-      else
-        unset ASCEND_RT_VISIBLE_DEVICES
-        unset VLLM_ASCEND_TORCH_PREFLIGHT_DEVICE
-        echo "Could not resolve a single-card Ascend device; probing runtime without device scoping"
-      fi
+      configure_single_card_ascend_device "$start_attempt"
     fi
 
     if wait_for_ascend_runtime_ready; then
