@@ -156,12 +156,17 @@ jobs:
             "${GITHUB_WORKSPACE}/vllm-hust-website"
           )
 
+          shopt -s nullglob dotglob
+          workspace_entries=("${GITHUB_WORKSPACE}"/*)
+          shopt -u nullglob dotglob
+          cleanup_paths=("${legacy_paths[@]}" "${workspace_entries[@]}")
+
           if command -v sudo >/dev/null 2>&1 \
             && [[ -x "$DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER" ]] \
-            && sudo -n "$DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER" cleanup-paths "${legacy_paths[@]}"; then
+            && sudo -n "$DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER" cleanup-paths "${cleanup_paths[@]}"; then
             mkdir -p "$ci_state_root" "$benchmark_results_root" "$ci_home" "$ci_runtime_root"
           else
-            rm -rf "${legacy_paths[@]}"
+            rm -rf "${cleanup_paths[@]}"
             mkdir -p "$ci_state_root" "$benchmark_results_root" "$ci_home" "$ci_runtime_root"
           fi
 
