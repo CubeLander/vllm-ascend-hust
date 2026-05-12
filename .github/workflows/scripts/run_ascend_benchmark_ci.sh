@@ -80,6 +80,7 @@ ASCEND_RUNTIME_READY_TIMEOUT_SECONDS=${ASCEND_RUNTIME_READY_TIMEOUT_SECONDS:-30}
 ASCEND_RUNTIME_READY_POLL_SECONDS=${ASCEND_RUNTIME_READY_POLL_SECONDS:-10}
 RESOURCE_BUSY_EXIT_CODE=${RESOURCE_BUSY_EXIT_CODE:-75}
 SUDO_AUTH_EXIT_CODE=${SUDO_AUTH_EXIT_CODE:-76}
+INVALID_BENCHMARK_RESULT_EXIT_CODE=${INVALID_BENCHMARK_RESULT_EXIT_CODE:-77}
 ASCEND_BENCHMARK_USE_SUDO=${ASCEND_BENCHMARK_USE_SUDO:-0}
 DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER=${DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER:-/usr/local/bin/run_ascend_benchmark_root_helper.sh}
 if [[ -n "${ASCEND_BENCHMARK_ROOT_HELPER:-}" ]]; then
@@ -508,11 +509,52 @@ run_same_spec_current_benchmark() {
     echo "same-spec benchmark did not produce submission artifacts under: $same_spec_submission_dir" >&2
     return 2
   fi
+  if ! validate_benchmark_result_file "$same_spec_raw_result"; then
+    return $?
+  fi
 
   mkdir -p "$SUBMISSION_DIR"
   cp "$same_spec_raw_result" "$RAW_RESULT_FILE"
   cp "$same_spec_submission_dir/leaderboard_manifest.json" "$SUBMISSION_DIR/leaderboard_manifest.json"
   cp "$same_spec_submission_dir/run_leaderboard.json" "$SUBMISSION_DIR/run_leaderboard.json"
+}
+
+validate_benchmark_result_file() {
+  local result_file=${1:-}
+
+  if [[ -z "$result_file" ]]; then
+    echo "validate_benchmark_result_file requires a result file path" >&2
+    return 2
+  fi
+  if [[ ! -f "$result_file" ]]; then
+    echo "benchmark result file not found: $result_file" >&2
+    return 2
+  fi
+
+  RESULT_FILE="$result_file" INVALID_EXIT_CODE="$INVALID_BENCHMARK_RESULT_EXIT_CODE" "${PYTHON_BIN}" - <<'PY'
+import json
+import os
+import sys
+
+result_file = os.environ["RESULT_FILE"]
+invalid_exit_code = int(os.environ["INVALID_EXIT_CODE"])
+
+with open(result_file, "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+
+completed = int(payload.get("completed", 0) or 0)
+failed = int(payload.get("failed", 0) or 0)
+total = int(payload.get("total_input", completed + failed) or (completed + failed))
+
+if completed == 0 and failed > 0:
+    print(
+        f"invalid-all-failed completed={completed} failed={failed} total_input={total}",
+        file=sys.stderr,
+    )
+    sys.exit(invalid_exit_code)
+
+print(f"validated benchmark result: completed={completed}, failed={failed}, total_input={total}")
+PY
 }
 
 allocate_local_port() {
@@ -1004,6 +1046,8 @@ else
     --save-result \
     --result-dir "$RESULT_ROOT" \
     --result-filename "$(basename "$RAW_RESULT_FILE")"
+
+  validate_benchmark_result_file "$RAW_RESULT_FILE"
 
   CORE_VERSION=$("${PYTHON_BIN}" - <<'PY'
 import vllm
