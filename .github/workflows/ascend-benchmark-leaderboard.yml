@@ -87,10 +87,6 @@ jobs:
     env:
       BENCHMARK_CHECKOUT_USE_SSH_443: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY != '' && '1' || '0' }}
       DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER: /usr/local/bin/run_ascend_benchmark_root_helper.sh
-      CI_STATE_ROOT: ${{ runner.workspace }}/vllm-ascend-hust-ci-state
-      BENCHMARK_RESULTS_ROOT: ${{ runner.workspace }}/vllm-ascend-hust-ci-state/benchmarks/ci
-      CI_HOME: ${{ runner.workspace }}/vllm-ascend-hust-ci-state/home
-      CI_RUNTIME_ROOT: ${{ runner.workspace }}/vllm-ascend-hust-ci-state/runtime
       COMPILE_CUSTOM_KERNELS: "1"
       HF_HUB_DISABLE_TELEMETRY: "1"
       HF_ENDPOINT: ${{ vars.HF_ENDPOINT || 'https://hf-mirror.com' }}
@@ -138,6 +134,22 @@ jobs:
       - name: Pre-clean stale checkout state
         shell: bash
         run: |
+          ci_state_root="$(python3 - <<'PY'
+import os
+print(os.path.realpath(os.path.join(os.environ['GITHUB_WORKSPACE'], '..', 'vllm-ascend-hust-ci-state')))
+PY
+          )"
+          benchmark_results_root="${ci_state_root}/benchmarks/ci"
+          ci_home="${ci_state_root}/home"
+          ci_runtime_root="${ci_state_root}/runtime"
+
+          {
+            echo "CI_STATE_ROOT=${ci_state_root}"
+            echo "BENCHMARK_RESULTS_ROOT=${benchmark_results_root}"
+            echo "CI_HOME=${ci_home}"
+            echo "CI_RUNTIME_ROOT=${ci_runtime_root}"
+          } >> "$GITHUB_ENV"
+
           legacy_paths=(
             "${GITHUB_WORKSPACE}/.benchmarks"
             "${GITHUB_WORKSPACE}/.ci-home"
@@ -151,10 +163,10 @@ jobs:
           if command -v sudo >/dev/null 2>&1 \
             && [[ -x "$DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER" ]] \
             && sudo -n "$DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER" cleanup-paths "${legacy_paths[@]}"; then
-            mkdir -p "$CI_STATE_ROOT" "$BENCHMARK_RESULTS_ROOT" "$CI_HOME" "$CI_RUNTIME_ROOT"
+            mkdir -p "$ci_state_root" "$benchmark_results_root" "$ci_home" "$ci_runtime_root"
           else
             rm -rf "${legacy_paths[@]}"
-            mkdir -p "$CI_STATE_ROOT" "$BENCHMARK_RESULTS_ROOT" "$CI_HOME" "$CI_RUNTIME_ROOT"
+            mkdir -p "$ci_state_root" "$benchmark_results_root" "$ci_home" "$ci_runtime_root"
           fi
 
       - name: Resolve benchmark target
