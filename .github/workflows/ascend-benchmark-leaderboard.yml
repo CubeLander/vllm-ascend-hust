@@ -86,6 +86,7 @@ jobs:
     timeout-minutes: 60
     env:
       BENCHMARK_CHECKOUT_USE_SSH_443: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY != '' && '1' || '0' }}
+      DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER: /usr/local/bin/run_ascend_benchmark_root_helper.sh
       CI_STATE_ROOT: ${{ github.workspace }}/../vllm-ascend-hust-ci-state
       BENCHMARK_RESULTS_ROOT: ${{ github.workspace }}/../vllm-ascend-hust-ci-state/benchmarks/ci
       CI_HOME: ${{ github.workspace }}/../vllm-ascend-hust-ci-state/home
@@ -143,10 +144,10 @@ jobs:
             "${GITHUB_WORKSPACE}/.ci-runtime"
           )
 
-          if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
-            sudo rm -rf "${legacy_paths[@]}"
-            sudo mkdir -p "$CI_STATE_ROOT" "$BENCHMARK_RESULTS_ROOT" "$CI_HOME" "$CI_RUNTIME_ROOT"
-            sudo chown -R "$(id -un):$(id -gn)" "$CI_STATE_ROOT"
+          if command -v sudo >/dev/null 2>&1 \
+            && [[ -x "$DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER" ]] \
+            && sudo -n "$DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER" cleanup-paths "${legacy_paths[@]}"; then
+            mkdir -p "$CI_STATE_ROOT" "$BENCHMARK_RESULTS_ROOT" "$CI_HOME" "$CI_RUNTIME_ROOT"
           else
             rm -rf "${legacy_paths[@]}"
             mkdir -p "$CI_STATE_ROOT" "$BENCHMARK_RESULTS_ROOT" "$CI_HOME" "$CI_RUNTIME_ROOT"

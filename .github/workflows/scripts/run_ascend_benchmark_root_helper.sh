@@ -3,7 +3,7 @@ set -euo pipefail
 
 subcommand=${1:-}
 if [[ -z "$subcommand" ]]; then
-  echo "Usage: $0 <runtime-ready|same-spec|serve> [args...]" >&2
+  echo "Usage: $0 <runtime-ready|same-spec|serve|cleanup-paths> [args...]" >&2
   exit 2
 fi
 shift || true
@@ -32,6 +32,17 @@ restore_user_workspace_ownership() {
 }
 
 case "$subcommand" in
+  cleanup-paths)
+    if [[ "$#" -eq 0 ]]; then
+      echo "cleanup-paths requires at least one path" >&2
+      exit 2
+    fi
+
+    for target in "$@"; do
+      [[ -z "$target" ]] && continue
+      rm -rf -- "$target"
+    done
+    ;;
   runtime-ready)
     "${PYTHON_BIN:?PYTHON_BIN must be set}" - <<'PY'
 import sys
@@ -49,8 +60,10 @@ PY
     same_spec_spec_file=${2:?same-spec spec file path is required}
     bash "$same_spec_runner" "$same_spec_spec_file"
     restore_user_workspace_ownership \
+      "${WORKSPACE_ROOT:-}" \
       "${RESULT_DIR:-}" \
       "${RESULT_ROOT:-}" \
+      "${CI_RUNTIME_ROOT:-}" \
       "${CURRENT_VLLM_CACHE_ROOT:-}" \
       "${CI_HOME:-}" \
       "${XDG_CACHE_HOME:-}" \
