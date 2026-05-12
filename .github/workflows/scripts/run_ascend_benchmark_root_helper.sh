@@ -8,6 +8,12 @@ if [[ -z "$subcommand" ]]; then
 fi
 shift || true
 
+# Some Ascend env helper scripts assume these variables exist and crash under
+# `set -u` when sudo strips them from the environment.
+export PATH="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+export PYTHONPATH="${PYTHONPATH:-}"
+
 case "$subcommand" in
   runtime-ready)
     "${PYTHON_BIN:?PYTHON_BIN must be set}" - <<'PY'
