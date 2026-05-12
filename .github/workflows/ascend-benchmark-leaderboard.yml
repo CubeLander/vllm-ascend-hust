@@ -209,7 +209,7 @@ jobs:
         with:
           ssh-key: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY }}
           ssh-strict: ${{ env.BENCHMARK_CHECKOUT_USE_SSH_443 != '1' }}
-          persist-credentials: false
+          persist-credentials: true
 
       - name: Checkout manual benchmark repo history
         if: ${{ github.event_name == 'workflow_dispatch' && env.ASCEND_HUST_LOCAL_CHECKOUT == '1' }}
@@ -218,7 +218,7 @@ jobs:
           fetch-depth: 0
           ssh-key: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY }}
           ssh-strict: ${{ env.BENCHMARK_CHECKOUT_USE_SSH_443 != '1' }}
-          persist-credentials: false
+          persist-credentials: true
 
       - name: Checkout manual benchmark target
         if: ${{ github.event_name == 'workflow_dispatch' && env.ASCEND_HUST_LOCAL_CHECKOUT != '1' }}
