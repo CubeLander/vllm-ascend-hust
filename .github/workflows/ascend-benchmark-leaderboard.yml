@@ -207,14 +207,17 @@ jobs:
         if: ${{ github.event_name != 'workflow_dispatch' }}
         uses: actions/checkout@v6.0.1
         with:
+          ssh-key: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY }}
+          ssh-strict: ${{ env.BENCHMARK_CHECKOUT_USE_SSH_443 != '1' }}
           persist-credentials: false
-          clean: false
 
       - name: Checkout manual benchmark repo history
         if: ${{ github.event_name == 'workflow_dispatch' && env.ASCEND_HUST_LOCAL_CHECKOUT == '1' }}
         uses: actions/checkout@v6.0.1
         with:
           fetch-depth: 0
+          ssh-key: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY }}
+          ssh-strict: ${{ env.BENCHMARK_CHECKOUT_USE_SSH_443 != '1' }}
           persist-credentials: false
 
       - name: Checkout manual benchmark target
