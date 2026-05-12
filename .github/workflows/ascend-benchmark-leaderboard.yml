@@ -86,6 +86,10 @@ jobs:
     timeout-minutes: 60
     env:
       BENCHMARK_CHECKOUT_USE_SSH_443: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY != '' && '1' || '0' }}
+      CI_STATE_ROOT: ${{ github.workspace }}/../vllm-ascend-hust-ci-state
+      BENCHMARK_RESULTS_ROOT: ${{ github.workspace }}/../vllm-ascend-hust-ci-state/benchmarks/ci
+      CI_HOME: ${{ github.workspace }}/../vllm-ascend-hust-ci-state/home
+      CI_RUNTIME_ROOT: ${{ github.workspace }}/../vllm-ascend-hust-ci-state/runtime
       COMPILE_CUSTOM_KERNELS: "1"
       HF_HUB_DISABLE_TELEMETRY: "1"
       HF_ENDPOINT: ${{ vars.HF_ENDPOINT || 'https://hf-mirror.com' }}
@@ -130,6 +134,24 @@ jobs:
       HUST_ASCEND_MANAGER_REPO: ${{ github.workspace }}/ascend-runtime-manager
 
     steps:
+      - name: Pre-clean stale checkout state
+        shell: bash
+        run: |
+          legacy_paths=(
+            "${GITHUB_WORKSPACE}/.benchmarks"
+            "${GITHUB_WORKSPACE}/.ci-home"
+            "${GITHUB_WORKSPACE}/.ci-runtime"
+          )
+
+          if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+            sudo rm -rf "${legacy_paths[@]}"
+            sudo mkdir -p "$CI_STATE_ROOT" "$BENCHMARK_RESULTS_ROOT" "$CI_HOME" "$CI_RUNTIME_ROOT"
+            sudo chown -R "$(id -un):$(id -gn)" "$CI_STATE_ROOT"
+          else
+            rm -rf "${legacy_paths[@]}"
+            mkdir -p "$CI_STATE_ROOT" "$BENCHMARK_RESULTS_ROOT" "$CI_HOME" "$CI_RUNTIME_ROOT"
+          fi
+
       - name: Resolve benchmark target
         shell: bash
         run: |
@@ -211,6 +233,9 @@ jobs:
             echo "ASCEND_HUST_TARGET_SHA=$target_sha"
             echo "ASCEND_HUST_TARGET_SHA_SHORT=$target_sha_short"
             echo "RUN_ID=ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${target_sha_short}"
+            echo "RESULT_ROOT=${BENCHMARK_RESULTS_ROOT}/ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${target_sha_short}"
+            echo "SUBMISSION_DIR=${BENCHMARK_RESULTS_ROOT}/ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${target_sha_short}/submissions/ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${target_sha_short}"
+            echo "BENCHMARK_COMMENT_PATH=${BENCHMARK_RESULTS_ROOT}/ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${target_sha_short}/benchmark_comment.md"
           } >> "$GITHUB_ENV"
 
       - name: Checkout vllm-hust repo
@@ -260,9 +285,9 @@ jobs:
         env:
           VLLM_HUST_REPO: ${{ github.workspace }}/vllm-hust
           VLLM_HUST_BENCHMARK_REPO: ${{ github.workspace }}/vllm-hust-benchmark
-          HOME: ${{ github.workspace }}/.ci-home
-          XDG_CACHE_HOME: ${{ github.workspace }}/.ci-home/.cache
-          XDG_CONFIG_HOME: ${{ github.workspace }}/.ci-home/.config
+          HOME: ${{ env.CI_HOME }}
+          XDG_CACHE_HOME: ${{ env.CI_HOME }}/.cache
+          XDG_CONFIG_HOME: ${{ env.CI_HOME }}/.config
         run: |
           mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME"
           source scripts/use_single_ascend_env.sh
@@ -305,6 +330,11 @@ jobs:
           VLLM_ASCEND_HUST_REPO: ${{ github.workspace }}
           VLLM_HUST_BENCHMARK_REPO: ${{ github.workspace }}/vllm-hust-benchmark
           VLLM_HUST_WEBSITE_REPO: ${{ github.workspace }}/vllm-hust-website
+          CI_STATE_ROOT: ${{ env.CI_STATE_ROOT }}
+          BENCHMARK_RESULTS_ROOT: ${{ env.BENCHMARK_RESULTS_ROOT }}
+          CI_HOME: ${{ env.CI_HOME }}
+          CI_RUNTIME_ROOT: ${{ env.CI_RUNTIME_ROOT }}
+          RESULT_ROOT: ${{ env.RESULT_ROOT }}
         run: |
           set +e
           benchmark_lock_file="${ASCEND_BENCHMARK_LOCK_FILE:-/tmp/vllm-ascend-hust-benchmark.lock}"
@@ -345,7 +375,7 @@ jobs:
           export PYTHONPATH="${GITHUB_WORKSPACE}/vllm-hust:${GITHUB_WORKSPACE}/vllm-hust-benchmark/src${PYTHONPATH:+:$PYTHONPATH}"
           PYTHON_BIN="$(hust_resolve_python_bin)"
           export PYTHON_BIN
-          export CURRENT_SUBMISSION_DIR="${GITHUB_WORKSPACE}/.benchmarks/ci/${RUN_ID}/submissions/${RUN_ID}"
+          export CURRENT_SUBMISSION_DIR="${SUBMISSION_DIR}"
           export SNAPSHOT_COMMIT_MESSAGE="chore: sync vllm-ascend benchmark snapshots ${RUN_ID}"
           bash .github/workflows/scripts/sync_benchmark_snapshots_to_github.sh
 
@@ -361,7 +391,7 @@ jobs:
           if not run_id:
             target_sha = os.environ.get('ASCEND_HUST_TARGET_SHA', os.environ['GITHUB_SHA'])
             run_id = f"ci-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}-{target_sha[:8]}"
-          result_root = Path(os.environ['GITHUB_WORKSPACE']) / '.benchmarks' / 'ci' / run_id
+          result_root = Path(os.environ['BENCHMARK_RESULTS_ROOT']) / run_id
           raw_result = result_root / 'raw_benchmark.json'
           leaderboard_entry = result_root / 'submissions' / run_id / 'run_leaderboard.json'
           summary_path = Path(os.environ['GITHUB_STEP_SUMMARY'])
@@ -497,7 +527,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ascend-benchmark-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}/.benchmarks/ci/
+          path: ${{ env.BENCHMARK_RESULTS_ROOT }}/
           if-no-files-found: warn
           retention-days: 14
 
@@ -515,7 +545,7 @@ jobs:
           from urllib import error, request
 
           run_id = os.environ.get('RUN_ID') or f"ci-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}-{(os.environ.get('ASCEND_HUST_TARGET_SHA') or os.environ['GITHUB_SHA'])[:8]}"
-          comment_path = Path(os.environ['GITHUB_WORKSPACE']) / '.benchmarks' / 'ci' / run_id / 'benchmark_comment.md'
+          comment_path = Path(os.environ['BENCHMARK_RESULTS_ROOT']) / run_id / 'benchmark_comment.md'
           marker = '<!-- ascend-benchmark-leaderboard-comment -->'
 
           if not comment_path.exists():
