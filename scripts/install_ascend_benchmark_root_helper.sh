@@ -21,6 +21,9 @@ require_command visudo
 
 if [[ ! -f "$SOURCE_HELPER" ]]; then
   echo "Benchmark root helper source not found: $SOURCE_HELPER" >&2
+  echo "Expected runner-local helper path: $REPO_ROOT/.github/workflows/scripts/run_ascend_benchmark_root_helper.sh" >&2
+  echo "Runner checkout fix: restore or sync the vllm-ascend-hust checkout on the runner host before reinstalling the helper." >&2
+  echo "Then rerun: sudo RUNNER_USER=$RUNNER_USER bash $REPO_ROOT/scripts/install_ascend_benchmark_root_helper.sh" >&2
   exit 1
 fi
 

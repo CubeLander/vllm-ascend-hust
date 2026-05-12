@@ -86,6 +86,8 @@ INVALID_BENCHMARK_RESULT_EXIT_CODE=${INVALID_BENCHMARK_RESULT_EXIT_CODE:-77}
 ASCEND_BENCHMARK_USE_SUDO=${ASCEND_BENCHMARK_USE_SUDO:-0}
 DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER=${DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER:-/usr/local/bin/run_ascend_benchmark_root_helper.sh}
 REPO_ASCEND_BENCHMARK_ROOT_HELPER=$VLLM_ASCEND_HUST_REPO/.github/workflows/scripts/run_ascend_benchmark_root_helper.sh
+REPO_ASCEND_BENCHMARK_ROOT_HELPER_INSTALL_SCRIPT=$VLLM_ASCEND_HUST_REPO/scripts/install_ascend_benchmark_root_helper.sh
+BENCHMARK_DIAGNOSTICS_FILE=${BENCHMARK_DIAGNOSTICS_FILE:-$RESULT_ROOT/benchmark_diagnostics.md}
 if [[ -n "${ASCEND_BENCHMARK_ROOT_HELPER:-}" ]]; then
   ASCEND_BENCHMARK_ROOT_HELPER=$ASCEND_BENCHMARK_ROOT_HELPER
 elif [[ -x "$DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER" ]]; then
@@ -202,6 +204,44 @@ build_sudo_env_preserve_list() {
   printf '%s\n' "$joined"
 }
 
+append_benchmark_diagnostic() {
+  local line=${1:-}
+
+  [[ -z "$line" ]] && return 0
+  printf '%s\n' "$line" >> "$BENCHMARK_DIAGNOSTICS_FILE"
+}
+
+benchmark_root_helper_fix_command() {
+  printf 'sudo RUNNER_USER=grunner bash %s\n' "$REPO_ASCEND_BENCHMARK_ROOT_HELPER_INSTALL_SCRIPT"
+}
+
+report_runner_checkout_fix() {
+  local missing_path=${1:-}
+
+  [[ -n "$missing_path" ]] && echo "Runner-local benchmark script missing from checkout: $missing_path" >&2
+  echo "Runner checkout fix: restore or sync the vllm-ascend-hust checkout on the runner host, then rerun the benchmark workflow." >&2
+
+  if [[ -n "$missing_path" ]]; then
+    append_benchmark_diagnostic "- Runner checkout script: missing at \`$missing_path\`"
+  fi
+  append_benchmark_diagnostic "- Runner checkout fix: \`restore or sync the vllm-ascend-hust checkout on the runner host, then rerun the benchmark workflow\`"
+}
+
+report_runner_host_fix() {
+  local fix_command
+
+  if [[ -f "$REPO_ASCEND_BENCHMARK_ROOT_HELPER_INSTALL_SCRIPT" ]]; then
+    fix_command=$(benchmark_root_helper_fix_command)
+    echo "Runner host fix: $fix_command" >&2
+    append_benchmark_diagnostic "- Runner host fix: \`$fix_command\`"
+    return 0
+  fi
+
+  echo "Runner-local install script missing from checkout: $REPO_ASCEND_BENCHMARK_ROOT_HELPER_INSTALL_SCRIPT" >&2
+  append_benchmark_diagnostic "- Runner install script: missing at \`$REPO_ASCEND_BENCHMARK_ROOT_HELPER_INSTALL_SCRIPT\`"
+  report_runner_checkout_fix "$REPO_ASCEND_BENCHMARK_ROOT_HELPER_INSTALL_SCRIPT"
+}
+
 export_sudo_preserved_env_vars() {
   local var_name
 
@@ -219,6 +259,10 @@ run_ascend_root_helper() {
     preserve_list=$(build_sudo_env_preserve_list)
     if [[ ! -x "$ASCEND_BENCHMARK_ROOT_HELPER" ]]; then
       echo "Ascend benchmark root helper is not executable: $ASCEND_BENCHMARK_ROOT_HELPER" >&2
+      append_benchmark_diagnostic "- Benchmark execution: \`benchmark root helper is not executable at $ASCEND_BENCHMARK_ROOT_HELPER\`"
+      if [[ "$ASCEND_BENCHMARK_ROOT_HELPER" == "$DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER" ]]; then
+        report_runner_host_fix
+      fi
       return 1
     fi
     if [[ -n "$preserve_list" ]]; then
@@ -236,8 +280,31 @@ verify_root_helper_matches_repo() {
   if [[ "$ASCEND_BENCHMARK_USE_SUDO" != "1" ]]; then
     return 0
   fi
+  if [[ ! -f "$REPO_ASCEND_BENCHMARK_ROOT_HELPER" ]]; then
+    echo "Runner-local benchmark root helper source missing from checkout: $REPO_ASCEND_BENCHMARK_ROOT_HELPER" >&2
+    append_benchmark_diagnostic "- Benchmark execution: \`runner-local benchmark root helper source is missing\`"
+    report_runner_checkout_fix "$REPO_ASCEND_BENCHMARK_ROOT_HELPER"
+    return 2
+  fi
+  if [[ ! -f "$REPO_ASCEND_BENCHMARK_ROOT_HELPER_INSTALL_SCRIPT" ]]; then
+    echo "Runner-local benchmark helper install script missing from checkout: $REPO_ASCEND_BENCHMARK_ROOT_HELPER_INSTALL_SCRIPT" >&2
+    append_benchmark_diagnostic "- Benchmark execution: \`runner-local benchmark helper install script is missing\`"
+    report_runner_checkout_fix "$REPO_ASCEND_BENCHMARK_ROOT_HELPER_INSTALL_SCRIPT"
+    return 2
+  fi
   if [[ "$ASCEND_BENCHMARK_ROOT_HELPER" != "$DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER" ]]; then
+    if [[ ! -x "$ASCEND_BENCHMARK_ROOT_HELPER" ]]; then
+      echo "Configured Ascend benchmark root helper is not executable: $ASCEND_BENCHMARK_ROOT_HELPER" >&2
+      append_benchmark_diagnostic "- Benchmark execution: \`configured benchmark root helper is not executable at $ASCEND_BENCHMARK_ROOT_HELPER\`"
+      return 2
+    fi
     return 0
+  fi
+  if [[ ! -x "$ASCEND_BENCHMARK_ROOT_HELPER" ]]; then
+    echo "Installed Ascend benchmark root helper is missing or not executable: $ASCEND_BENCHMARK_ROOT_HELPER" >&2
+    append_benchmark_diagnostic "- Benchmark execution: \`installed benchmark root helper is missing or not executable at $ASCEND_BENCHMARK_ROOT_HELPER\`"
+    report_runner_host_fix
+    return 2
   fi
   if [[ ! -r "$ASCEND_BENCHMARK_ROOT_HELPER" || ! -r "$REPO_ASCEND_BENCHMARK_ROOT_HELPER" ]]; then
     return 0
@@ -248,7 +315,9 @@ verify_root_helper_matches_repo() {
 
   echo "Installed Ascend benchmark root helper is stale: $ASCEND_BENCHMARK_ROOT_HELPER" >&2
   echo "Expected it to match: $REPO_ASCEND_BENCHMARK_ROOT_HELPER" >&2
-  echo "Runner host fix: sudo RUNNER_USER=grunner bash $VLLM_ASCEND_HUST_REPO/scripts/install_ascend_benchmark_root_helper.sh" >&2
+  append_benchmark_diagnostic "- Benchmark execution: \`installed benchmark root helper is stale at $ASCEND_BENCHMARK_ROOT_HELPER\`"
+  append_benchmark_diagnostic "- Expected helper source: \`$REPO_ASCEND_BENCHMARK_ROOT_HELPER\`"
+  report_runner_host_fix
   return 2
 }
 
@@ -599,6 +668,7 @@ if [[ -z "$PORT" ]]; then
 fi
 
 mkdir -p "$RESULT_ROOT" "$SUBMISSIONS_ROOT" "$AGGREGATE_OUTPUT_DIR" "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$PROCESS_MARKER_DIR"
+: > "$BENCHMARK_DIAGNOSTICS_FILE"
 cleanup_previous_ci_processes
 
 NPU_SMI_BIN="$(resolve_npu_smi_bin 2>/dev/null || true)"
