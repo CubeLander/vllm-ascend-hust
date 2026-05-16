@@ -14,6 +14,9 @@ PLUGIN_REPO="${1:-${ASCEND_REPO_ROOT}}"
 CURRENT_USER_NAME="$(id -un 2>/dev/null || printf '%s' "${USER:-}")"
 CURRENT_USER_HOME="$(getent passwd "$CURRENT_USER_NAME" 2>/dev/null | cut -d: -f6 || true)"
 
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/hust_ascend_manager_helper.sh"
+
 resolve_writable_dir() {
   local candidate
   local parent_dir
@@ -91,12 +94,36 @@ ALLOW_EXISTING_INSTALL_FALLBACK="${ALLOW_EXISTING_INSTALL_FALLBACK:-0}"
 export VLLM_ASCEND_EXPECTED_REPO="${PLUGIN_REPO}"
 mkdir -p "${CURRENT_USER_CACHE_HOME}/pip" "${CURRENT_USER_CONFIG_HOME}"
 
-if ! env \
-  "HOME=${CURRENT_USER_HOME}" \
-  "XDG_CACHE_HOME=${CURRENT_USER_CACHE_HOME}" \
-  "XDG_CONFIG_HOME=${CURRENT_USER_CONFIG_HOME}" \
-  "PIP_CACHE_DIR=${CURRENT_USER_CACHE_HOME}/pip" \
-  python -m pip install -e "${PLUGIN_REPO}" --no-build-isolation --no-deps; then
+PYTHON_BIN="$(hust_resolve_python_bin 2>/dev/null)" || {
+  echo "[ERROR] Could not locate python3/python for plugin installation"
+  exit 1
+}
+
+if ! "${PYTHON_BIN}" - <<'PY' >/dev/null 2>&1
+import setuptools_scm
+PY
+then
+  echo "[INFO] Installing missing build metadata dependency: setuptools-scm>=8"
+  if ! (
+    export HOME="${CURRENT_USER_HOME}"
+    export XDG_CACHE_HOME="${CURRENT_USER_CACHE_HOME}"
+    export XDG_CONFIG_HOME="${CURRENT_USER_CONFIG_HOME}"
+    export PIP_CACHE_DIR="${CURRENT_USER_CACHE_HOME}/pip"
+    hust_run_pip install "setuptools-scm>=8"
+  ); then
+    echo "[ERROR] Failed to install setuptools-scm required for editable metadata generation"
+    exit 1
+  fi
+fi
+
+if ! (
+  export HOME="${CURRENT_USER_HOME}"
+  export XDG_CACHE_HOME="${CURRENT_USER_CACHE_HOME}"
+  export XDG_CONFIG_HOME="${CURRENT_USER_CONFIG_HOME}"
+  export PIP_CACHE_DIR="${CURRENT_USER_CACHE_HOME}/pip"
+  export COMPILE_CUSTOM_KERNELS="${COMPILE_CUSTOM_KERNELS}"
+  hust_run_pip install -e "${PLUGIN_REPO}" --no-build-isolation --no-deps
+); then
   if [[ "${ALLOW_EXISTING_INSTALL_FALLBACK}" == "1" ]]; then
     echo "[WARN] Local editable install failed."
     echo "[WARN] Continue with currently installed vllm-ascend-hust package because ALLOW_EXISTING_INSTALL_FALLBACK=1."
@@ -107,7 +134,7 @@ if ! env \
 fi
 
 echo "[INFO] Checking vLLM platform plugin entry points"
-python - <<'PY'
+"${PYTHON_BIN}" - <<'PY'
 import os
 from pathlib import Path
 from importlib.metadata import entry_points

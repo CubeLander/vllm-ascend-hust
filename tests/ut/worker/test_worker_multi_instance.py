@@ -61,30 +61,60 @@ class TestDetermineAvailableMemoryMultiInstance(TestBase):
         worker.model_runner = MagicMock()
         worker.model_runner.model_memory_usage = model_memory_usage
 
+        mock_cache_config = MagicMock()
+        mock_cache_config.kv_cache_memory_bytes = None
+        worker.cache_config = mock_cache_config
+
         mock_snapshot = MagicMock()
         mock_snapshot.free_memory = init_free_memory
         mock_snapshot.total_memory = init_total_memory
         worker.init_snapshot = mock_snapshot
 
         worker.requested_memory = requested_memory
+        worker.device = "npu:0"
         return worker
 
     @staticmethod
     def _make_profile_result(free_memory_after: int, non_kv_cache_memory: int):
-        """Return a mock profile_result compatible with memory_profiling output."""
+        """Return a mock profile_result compatible with memory_profiling output.
+
+        The worker code recomputes non_kv_cache_memory as:
+            non_torch_increase + torch_peak_increase + weights_memory
+        We set non_torch_increase=0, before_profile.torch_peak=0 (so
+        torch_peak_increase = peak - 0 = 0 since memory_stats is mocked to
+        return peak=0), and weights_memory=non_kv_cache_memory, ensuring the
+        recomputed value equals the requested non_kv_cache_memory.
+        """
         profile_result = MagicMock()
         profile_result.after_profile.free_memory = free_memory_after
         profile_result.non_kv_cache_memory = non_kv_cache_memory
+        profile_result.non_torch_increase = 0
+        profile_result.before_profile.torch_peak = 0
+        profile_result.weights_memory = non_kv_cache_memory
         return profile_result
 
     @staticmethod
     def _patch_memory_profiling(profile_result):
-        """Return a mock for `memory_profiling` that yields *profile_result*."""
+        """Return a context manager mocking `memory_profiling` and `torch.npu.memory_stats`."""
+        from contextlib import contextmanager
+
         mock_ctx = MagicMock()
         mock_ctx.__enter__ = MagicMock(return_value=profile_result)
         mock_ctx.__exit__ = MagicMock(return_value=False)
         mock_profiling = MagicMock(return_value=mock_ctx)
-        return patch("vllm_ascend.worker.worker.memory_profiling", mock_profiling)
+
+        @contextmanager
+        def combined():
+            with (
+                patch("vllm_ascend.worker.worker.memory_profiling", mock_profiling),
+                patch(
+                    "torch.npu.memory_stats",
+                    return_value={"allocated_bytes.all.peak": 0},
+                ),
+            ):
+                yield
+
+        return combined()
 
     # ------------------------------------------------------------------ #
     # Tests
@@ -95,9 +125,9 @@ class TestDetermineAvailableMemoryMultiInstance(TestBase):
         """Baseline: single instance on an empty card yields positive KV cache."""
         total = int(64 * GiB_bytes)
         gpu_util = 0.9
-        requested_memory = int(total * gpu_util)   # 57.6 GiB
-        init_free = int(62 * GiB_bytes)            # almost all free
-        non_kv_cache = int(0.5 * GiB_bytes)        # Qwen3-0.6B weights
+        requested_memory = int(total * gpu_util)  # 57.6 GiB
+        init_free = int(62 * GiB_bytes)  # almost all free
+        non_kv_cache = int(0.5 * GiB_bytes)  # Qwen3-0.6B weights
 
         worker = self._make_worker(requested_memory, init_free, total)
         profile_result = self._make_profile_result(
@@ -134,15 +164,15 @@ class TestDetermineAvailableMemoryMultiInstance(TestBase):
         """
         total = int(64 * GiB_bytes)
         gpu_util = 0.4
-        requested_memory = int(total * gpu_util)          # 25.6 GiB
+        requested_memory = int(total * gpu_util)  # 25.6 GiB
 
         # First instance already occupies its full requested_memory slice
-        first_instance_used = requested_memory            # 25.6 GiB
-        init_free = total - first_instance_used           # ~38.4 GiB
+        first_instance_used = requested_memory  # 25.6 GiB
+        init_free = total - first_instance_used  # ~38.4 GiB
 
         # After the fix: profiling correctly reports only the second
         # instance's own model weights, not the first instance's memory.
-        non_kv_cache = int(0.5 * GiB_bytes)              # Qwen3-0.6B weights
+        non_kv_cache = int(0.5 * GiB_bytes)  # Qwen3-0.6B weights
 
         worker = self._make_worker(requested_memory, init_free, total)
         profile_result = self._make_profile_result(
@@ -154,7 +184,8 @@ class TestDetermineAvailableMemoryMultiInstance(TestBase):
             result = worker.determine_available_memory()
 
         self.assertGreater(
-            result, 0,
+            result,
+            0,
             "Second instance must have positive KV cache memory. "
             "A non-positive value means the multi-instance OOM bug "
             "(PR #7427) has regressed.",
@@ -179,10 +210,10 @@ class TestDetermineAvailableMemoryMultiInstance(TestBase):
         """
         total = int(64 * GiB_bytes)
         gpu_util = 0.4
-        requested_memory = int(total * gpu_util)   # 25.6 GiB
+        requested_memory = int(total * gpu_util)  # 25.6 GiB
 
-        first_instance_used = requested_memory     # 25.6 GiB
-        init_free = total - first_instance_used    # ~38.4 GiB
+        first_instance_used = requested_memory  # 25.6 GiB
+        init_free = total - first_instance_used  # ~38.4 GiB
 
         # Buggy: non_kv_cache_memory = first-instance memory + second-instance weights
         buggy_non_kv_cache = int((25.6 + 0.5) * GiB_bytes)  # ~26.1 GiB
@@ -199,7 +230,8 @@ class TestDetermineAvailableMemoryMultiInstance(TestBase):
 
         # Pre-fix: 25.6 GiB - 26.1 GiB = -0.5 GiB  (negative → OOM)
         self.assertLess(
-            result, 0,
+            result,
+            0,
             "With the pre-fix (buggy) non_kv_cache_memory the result must be "
             "negative; this documents the OOM regression that PR #7427 fixed.",
         )
@@ -222,9 +254,8 @@ class TestDetermineAvailableMemoryMultiInstance(TestBase):
             non_kv_cache_memory=int(0.5 * GiB_bytes),
         )
 
-        with self._patch_memory_profiling(profile_result):
-            with self.assertRaises(AssertionError) as ctx:
-                worker.determine_available_memory()
+        with self._patch_memory_profiling(profile_result), self.assertRaises(AssertionError) as ctx:
+            worker.determine_available_memory()
 
         self.assertIn("Error in memory profiling", str(ctx.exception))
 
@@ -237,13 +268,13 @@ class TestDetermineAvailableMemoryMultiInstance(TestBase):
         non_kv_cache_memory (i.e. there is room for at least some KV blocks),
         the result must be positive.
         """
-        total = int(32 * GiB_bytes)       # smaller card (e.g. 910B1)
+        total = int(32 * GiB_bytes)  # smaller card (e.g. 910B1)
         gpu_util = 0.3
-        requested_memory = int(total * gpu_util)   # 9.6 GiB
+        requested_memory = int(total * gpu_util)  # 9.6 GiB
 
         # First instance has consumed most of its requested slice
-        first_instance_used = requested_memory     # 9.6 GiB
-        init_free = total - first_instance_used    # 22.4 GiB
+        first_instance_used = requested_memory  # 9.6 GiB
+        init_free = total - first_instance_used  # 22.4 GiB
 
         non_kv_cache = int(0.5 * GiB_bytes)  # Qwen3-0.6B
 
@@ -336,7 +367,7 @@ def test_select_best_idle_ascend_device_skips_unprobeable_candidate():
     assert [call.args[0] for call in mock_probe.call_args_list] == [7, 4]
 
 
-def test_auto_select_idle_ascend_device_sets_visible_device(monkeypatch):
+def test_auto_select_idle_ascend_device_returns_selected_device(monkeypatch):
     monkeypatch.delenv("ASCEND_RT_VISIBLE_DEVICES", raising=False)
     parallel_config = SimpleNamespace(world_size=1, local_world_size=1)
 
@@ -346,9 +377,12 @@ def test_auto_select_idle_ascend_device_sets_visible_device(monkeypatch):
             "vllm_ascend.worker.worker._select_best_idle_ascend_device",
             return_value=(6, int(61.5 * GiB_bytes), int(64 * GiB_bytes)),
         ):
-        _maybe_auto_select_idle_ascend_device(local_rank=0, parallel_config=parallel_config)
+        selected_device = _maybe_auto_select_idle_ascend_device(
+            local_rank=0, parallel_config=parallel_config
+        )
 
-    assert os.environ["ASCEND_RT_VISIBLE_DEVICES"] == "6"
+    assert selected_device == 6
+    assert "ASCEND_RT_VISIBLE_DEVICES" not in os.environ
     mock_logger.info.assert_called_once()
 
 
@@ -373,19 +407,19 @@ def test_get_visible_ascend_device_count_prefers_env_without_torch_init(monkeypa
     mock_run.assert_not_called()
 
 
-def test_auto_select_idle_ascend_device_avoids_torch_device_count_before_visibility(monkeypatch):
+def test_auto_select_idle_ascend_device_does_not_touch_torch_device_count(monkeypatch):
     monkeypatch.delenv("ASCEND_RT_VISIBLE_DEVICES", raising=False)
     parallel_config = SimpleNamespace(world_size=1, local_world_size=1)
 
     with patch("vllm_ascend.worker.worker._get_visible_ascend_device_count", return_value=8), \
         patch("vllm_ascend.worker.worker._select_best_idle_ascend_device", return_value=(6, int(61.5 * GiB_bytes), int(64 * GiB_bytes))), \
-        patch("torch.npu.device_count", side_effect=AssertionError("torch.npu.device_count should not run before visibility is fixed")):
-        _maybe_auto_select_idle_ascend_device(local_rank=0, parallel_config=parallel_config)
+        patch("torch.npu.device_count", side_effect=AssertionError("torch.npu.device_count should not run during auto-selection")):
+        selected_device = _maybe_auto_select_idle_ascend_device(local_rank=0, parallel_config=parallel_config)
 
-    assert os.environ["ASCEND_RT_VISIBLE_DEVICES"] == "6"
+    assert selected_device == 6
 
 
-def test_init_device_retries_selected_physical_device_when_logical_binding_fails():
+def test_init_device_falls_back_to_local_rank_when_auto_selected_device_fails():
     with patch.object(NPUWorker, "__init__", lambda self, **kwargs: None):
         worker = NPUWorker()
 
@@ -412,7 +446,7 @@ def test_init_device_retries_selected_physical_device_when_logical_binding_fails
 
     with patch("vllm_ascend.worker.worker._maybe_auto_select_idle_ascend_device", return_value=7), \
         patch("vllm_ascend.worker.worker.torch.device", side_effect=lambda value: value), \
-        patch("vllm_ascend.worker.worker.torch.npu.set_device", side_effect=[RuntimeError("logical binding failed"), None]) as mock_set_device, \
+        patch("vllm_ascend.worker.worker.torch.npu.set_device", side_effect=[RuntimeError("auto-selected init failed"), None]) as mock_set_device, \
         patch("vllm_ascend.worker.worker.MemorySnapshot", return_value=mock_snapshot), \
         patch("vllm_ascend.worker.worker.gc.collect"), \
         patch("vllm_ascend.worker.worker.torch.npu.empty_cache"), \
@@ -426,6 +460,6 @@ def test_init_device_retries_selected_physical_device_when_logical_binding_fails
         patch("vllm.triton_utils.HAS_TRITON", False):
         device = worker._init_device()
 
-    assert device == "npu:7"
-    assert mock_set_device.call_args_list == [(("npu:0",),), (("npu:7",),)]
+    assert device == "npu:0"
+    assert mock_set_device.call_args_list == [(("npu:7",),), (("npu:0",),)]
     mock_logger.warning.assert_called_once()
