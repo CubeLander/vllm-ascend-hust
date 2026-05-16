@@ -88,6 +88,7 @@ jobs:
       BENCHMARK_CHECKOUT_USE_SSH_443: ${{ secrets.VLLM_ASCEND_HUST_BENCHMARK_SSH_KEY != '' && '1' || '0' }}
       DEFAULT_SYSTEM_ASCEND_BENCHMARK_ROOT_HELPER: /usr/local/bin/run_ascend_benchmark_root_helper.sh
       COMPILE_CUSTOM_KERNELS: "1"
+      SOC_VERSION: ascend910b3
       HF_HUB_DISABLE_TELEMETRY: "1"
       HF_ENDPOINT: ${{ vars.HF_ENDPOINT || 'https://hf-mirror.com' }}
       HF_HOME: ${{ github.workspace }}/../.hf-cache
@@ -390,6 +391,9 @@ jobs:
           chmod 700 "$HF_HOME"
           echo "HF endpoint: $HF_ENDPOINT"
 
+      - name: Acquire Ascend hardware lock
+        run: bash .github/workflows/scripts/acquire_ascend_hardware_lock.sh
+
       - name: Prepare Ascend runtime and install repos
         env:
           VLLM_HUST_REPO: ${{ github.workspace }}/vllm-hust
@@ -400,10 +404,27 @@ jobs:
         run: |
           mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME"
           source scripts/use_single_ascend_env.sh
+          hust-ascend-manager setup --install-python-stack --non-interactive
           export PYTHONPATH="$VLLM_HUST_REPO:$VLLM_HUST_BENCHMARK_REPO/src${PYTHONPATH:+:$PYTHONPATH}"
           hust_run_pip install "torch==2.9.0" "torch-npu==2.9.0"
           hust_run_pip install "numpy<2.0.0" scipy attrs decorator psutil
           hust_run_pip install -r "$VLLM_HUST_REPO/requirements/common.txt"
+          PYTHON_BIN="$(hust_resolve_python_bin)"
+          "$PYTHON_BIN" - <<'PY'
+          import decorator
+          import scipy
+          import scipy.sparse
+
+          print(f"decorator={decorator.__version__}")
+          print(f"scipy={scipy.__version__}")
+          PY
+          "$PYTHON_BIN" - <<'PY'
+          import torch
+          import torch_npu
+
+          print(f"torch={torch.__version__}")
+          print(f"torch_npu={torch_npu.__version__}")
+          PY
           bash scripts/install_local_ascend_plugin.sh "$GITHUB_WORKSPACE"
           hust_run_pip install "huggingface_hub>=0.20" jsonschema
 
@@ -487,6 +508,10 @@ jobs:
           export CURRENT_SUBMISSION_DIR="${SUBMISSION_DIR}"
           export SNAPSHOT_COMMIT_MESSAGE="chore: sync vllm-ascend benchmark snapshots ${RUN_ID}"
           bash .github/workflows/scripts/sync_benchmark_snapshots_to_github.sh
+
+      - name: Release Ascend hardware lock
+        if: always()
+        run: bash .github/workflows/scripts/release_ascend_hardware_lock.sh
 
       - name: Build benchmark summary artifacts
         if: always()
