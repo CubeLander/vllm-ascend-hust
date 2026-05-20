@@ -66,6 +66,9 @@ from vllm_ascend.utils import (
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
+_WORKER_DEVICE_INDEX_ENV = "VLLM_ASCEND_WORKER_DEVICE_INDEX"
+_WORKER_PHYSICAL_DEVICE_ENV = "VLLM_ASCEND_WORKER_PHYSICAL_DEVICE"
+
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
 from vllm.utils.torch_utils import set_random_seed  # noqa: E402
@@ -238,6 +241,23 @@ def _maybe_auto_select_idle_ascend_device(local_rank: int, parallel_config) -> N
         free_memory / GiB_bytes,
         total_memory / GiB_bytes,
     )
+
+
+def _get_worker_device_index(local_rank: int) -> int:
+    raw_device_index = os.environ.get(_WORKER_DEVICE_INDEX_ENV)
+    if raw_device_index is None:
+        return local_rank
+    try:
+        device_index = int(raw_device_index)
+    except ValueError as exc:
+        raise RuntimeError(f"{_WORKER_DEVICE_INDEX_ENV} must be an integer, got {raw_device_index!r}.") from exc
+    if device_index < 0:
+        raise RuntimeError(f"{_WORKER_DEVICE_INDEX_ENV} must be non-negative, got {device_index}.")
+    return device_index
+
+
+def _get_worker_physical_device_id(local_rank: int) -> str:
+    return os.environ.get(_WORKER_PHYSICAL_DEVICE_ENV, str(local_rank))
 
 
 class NPUWorker(WorkerBase):
@@ -421,7 +441,8 @@ class NPUWorker(WorkerBase):
     def _init_device(self):
         _maybe_auto_select_idle_ascend_device(self.local_rank, self.parallel_config)
 
-        device = torch.device(f"npu:{self.local_rank}")
+        worker_device_index = _get_worker_device_index(self.local_rank)
+        device = torch.device(f"npu:{worker_device_index}")
         torch.npu.set_device(device)
 
         # Import _inductor for graph mode execution with triton
@@ -474,7 +495,7 @@ class NPUWorker(WorkerBase):
         # binding cpu
         if get_ascend_config().enable_cpu_binding:
             try:
-                bind_cpus(self.local_rank)
+                bind_cpus(worker_device_index)
             except Exception as e:
                 logger.warning(f"Bind cpus failed in rank{self.local_rank}: {e} Skip binding cpu.")
         return device
@@ -748,8 +769,9 @@ class NPUWorker(WorkerBase):
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
         init_batch_invariance()
+        worker_device_index = _get_worker_device_index(self.local_rank)
         init_distributed_environment(
-            self.parallel_config.world_size, self.rank, self.distributed_init_method, self.local_rank, "hccl"
+            self.parallel_config.world_size, self.rank, self.distributed_init_method, worker_device_index, "hccl"
         )
         ensure_model_parallel_initialized(
             self.parallel_config.tensor_parallel_size,
@@ -813,9 +835,10 @@ class NPUWorker(WorkerBase):
         import subprocess
 
         logger.info("check_health Start!")
+        npu_smi_device_id = _get_worker_physical_device_id(self.local_rank)
         try:
             result = subprocess.run(
-                ["npu-smi", "info", "-i", str(self.local_rank), "-t", "health"],
+                ["npu-smi", "info", "-i", npu_smi_device_id, "-t", "health"],
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -825,13 +848,13 @@ class NPUWorker(WorkerBase):
                 parse_text_output(result.stdout)
                 logger.info("check_health success!")
             else:
-                logger.info(f"query NPU card {self.local_rank} fail: {result.stderr}")
+                logger.info(f"query NPU card {npu_smi_device_id} fail: {result.stderr}")
         except subprocess.TimeoutExpired:
-            logger.info(f"query NPU card  {self.local_rank} timeout.")
+            logger.info(f"query NPU card  {npu_smi_device_id} timeout.")
         except FileNotFoundError:
             logger.info("npu-smi tool not found.")
         except Exception as e:
-            logger.info(f"query NPU card {self.local_rank} fail: {e}")
+            logger.info(f"query NPU card {npu_smi_device_id} fail: {e}")
         return
 
 
