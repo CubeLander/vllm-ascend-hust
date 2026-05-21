@@ -495,9 +495,31 @@ class NPUWorker(WorkerBase):
         )
         device_index = selected_device if selected_device is not None else self.local_rank
 
-        worker_device_index = _get_worker_device_index(self.local_rank)
-        device = torch.device(f"npu:{worker_device_index}")
-        torch.npu.set_device(device)
+        worker_device_index_env = os.getenv(_WORKER_DEVICE_INDEX_ENV)
+        if worker_device_index_env is not None:
+            worker_device_index = _get_worker_device_index(self.local_rank)
+            device = torch.device(f"npu:{worker_device_index}")
+            torch.npu.set_device(device)
+        else:
+            worker_device_index = device_index
+            device = torch.device(f"npu:{worker_device_index}")
+            try:
+                torch.npu.set_device(device)
+            except Exception as e:
+                if worker_device_index != self.local_rank:
+                    logger.warning(
+                        "Failed to initialize auto-selected NPU device %s for "
+                        "local rank %s; falling back to local rank device %s: %s",
+                        worker_device_index,
+                        self.local_rank,
+                        self.local_rank,
+                        e,
+                    )
+                    worker_device_index = self.local_rank
+                    device = torch.device(f"npu:{worker_device_index}")
+                    torch.npu.set_device(device)
+                else:
+                    raise
 
         # Import _inductor for graph mode execution with triton
         # This lazy import avoids torch_npu re-initialization in patch
